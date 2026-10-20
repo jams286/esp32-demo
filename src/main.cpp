@@ -14,9 +14,7 @@
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <Preferences.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <NimBLEDevice.h>
 #include <esp_chip_info.h>
 #include <esp_mac.h>
 #include <esp_sleep.h>
@@ -38,7 +36,7 @@
 
 #define LED_PIN 2
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 #define FW_BUILD __DATE__ " " __TIME__
 
 // La contraseña viene de secrets.ini (ver README); sin ella no se compila
@@ -615,19 +613,19 @@ const char *vendorStr(uint16_t id) {
 void scanBle() {
   header("Dispositivos Bluetooth LE");
   if (!bleReady) {
-    BLEDevice::init("");
+    NimBLEDevice::init("");
     bleReady = true;
   }
-  BLEScan *scan = BLEDevice::getScan();
+  NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(99);
   Serial.println(C_DIM "  escaneando 5 s..." C_RESET);
-  BLEScanResults *found = scan->start(5, false);
-  int n = found->getCount();
+  NimBLEScanResults found = scan->getResults(5000, false);
+  int n = found.getCount();
   if (n == 0) Serial.println("  No encontré dispositivos.");
   for (int i = 0; i < n; i++) {
-    BLEAdvertisedDevice d = found->getDevice(i);
+    const NimBLEAdvertisedDevice &d = *found.getDevice(i);
     String name = d.haveName() ? String(d.getName().c_str()) : String("(sin nombre)");
     const char *vendor = nullptr;
     if (d.haveManufacturerData()) {
