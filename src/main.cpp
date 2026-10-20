@@ -17,6 +17,8 @@
 #include <NimBLEDevice.h>
 #include <esp_chip_info.h>
 #include <esp_mac.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -37,7 +39,7 @@
 
 #define LED_PIN 2
 
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 #define FW_BUILD __DATE__ " " __TIME__
 
 // La contraseña viene de secrets.ini (ver README); sin ella no se compila
@@ -56,7 +58,7 @@ static_assert(sizeof(OTA_PASSWORD) > 8, "OTA_PASSWORD debe tener al menos 8 cara
 #define C_CYAN    "\033[36m"
 
 const char *PORTAL_SSID = "ESP32-Setup";
-const char *HOSTNAME = "esp32-demo";
+char HOSTNAME[24] = "esp32-demo";  // setup() lo completa: esp32-demo-xxxx (últimos 2 bytes de la MAC)
 const uint32_t CONNECT_TIMEOUT_MS = 20000;
 const uint32_t PORTAL_LINGER_MS = 60000;  // tiempo que sigue el portal tras conectar
 
@@ -173,6 +175,7 @@ void printMenu() {
   Serial.println("  " C_YELLOW "u" C_RESET "  coprocesador ULP: LED y sensor táctil mientras el CPU duerme");
   Serial.println("  " C_YELLOW "o" C_RESET "  actualizaciones OTA: versión, particiones y rollback");
   Serial.println("  " C_YELLOW "e" C_RESET "  cifrado por hardware: AES y SHA-256 contra software");
+  Serial.println("  " C_YELLOW "p" C_RESET "  ESP-NOW: comunicación directa entre placas");
   Serial.println("  " C_YELLOW "h" C_RESET "  este menú");
 }
 
@@ -484,7 +487,7 @@ void handleSave() {
            "if(s.state=='ok'){st.innerHTML=\"<span class='ok'>✔ ¡Conectado!</span>\";"
            "out.innerHTML=\"<p>IP en tu red: <b>\"+s.ip+\"</b></p><p>Vuelve a tu Wi-Fi de siempre y abre:</p>"
            "<a class='btn' href='http://\"+s.ip+\"/panel'>http://\"+s.ip+\"</a>"
-           "<p class='small'>o http://esp32-demo.local. La red ESP32-Setup se apagará en un minuto.</p>\";return}"
+           "<p class='small'>o http://" + String(HOSTNAME) + ".local. La red ESP32-Setup se apagará en un minuto.</p>\";return}"
            "if(s.state=='fail'){st.innerHTML=\"<span class='err'>✖ No se pudo conectar: \"+s.msg+\"</span>\";"
            "out.innerHTML=\"<a class='btn' href='/'>Intentar de nuevo</a>\";return}"
            "}catch(e){if(++fails==5){st.innerHTML='Se perdió la conexión con el ESP32.';"
@@ -1026,6 +1029,7 @@ void handleUpdateDone() {
 }
 
 void liveSample();  // sección "panel en vivo", más abajo
+void espNowPoll();  // sección ESP-NOW, más abajo
 
 void otaMenu() {
   header("Actualizaciones OTA");
@@ -1055,7 +1059,7 @@ void otaMenu() {
   if (bad) Serial.printf("  Último rollback: la imagen de %s se revirtió por fallar antes de validarse\n", bad->label);
   else Serial.println("  Último rollback: ninguno");
   Serial.println("\n  Para actualizar:");
-  Serial.printf ("   - desde el PC: " C_BOLD "pio run -e esp32dev-ota -t upload" C_RESET " (o --upload-port <ip>)\n");
+  Serial.printf ("   - desde el PC: " C_BOLD "pio run -e esp32dev-ota -t upload" C_RESET " (--upload-port <ip o %s.local>)\n", HOSTNAME);
   Serial.printf ("   - desde el navegador: " C_BOLD "http://%s/update" C_RESET " (usuario admin)\n",
                  WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "<ip>");
 
@@ -1074,6 +1078,7 @@ void otaMenu() {
     if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
     updateLed();
     liveSample();
+    espNowPoll();
     delay(5);
   }
   if (tolower(Serial.read()) != 'v') {
@@ -1355,6 +1360,8 @@ void jsonStr(String &j, const String &s) {
   j += '"';
 }
 
+void espNowPeersJson(String &j);  // sección ESP-NOW, más abajo
+
 void handleApiLive() {
   uint32_t since = server.hasArg("since") ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0;
   if (since > liveSeq) since = 0;  // el ESP32 se reinició: el cliente tenía un seq de la vida anterior
@@ -1398,6 +1405,8 @@ void handleApiLive() {
   } else {
     j += "null";
   }
+  j += ",\"peers\":";
+  espNowPeersJson(j);
   j += '}';
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", j);
@@ -1446,6 +1455,7 @@ h2{font-size:1em;margin:22px 0 8px}.lg span{margin-right:12px;font-size:.8em;whi
 <canvas id='c1'></canvas><div class='lg' id='lg'></div><div class='pb' id='pb'></div>
 <h2>Señal Wi-Fi (dBm)</h2><canvas id='c2'></canvas>
 <h2>RAM libre (KB)</h2><canvas id='c3'></canvas>
+<h2>Placas ESP-NOW</h2><div class='pb' id='np'></div>
 <h2>Última sesión del ULP</h2><canvas id='c4'></canvas><p class='small' id='ui'>Todavía no hay una sesión.</p>
 <button class='btn' id='ub' onclick='runUlp()'>Ejecutar demo ULP (el ESP32 duerme ~15 s)</button>
 <p class='small' id='um'></p>
@@ -1501,6 +1511,11 @@ function cards(n){
  $('ot').textContent=n.ota?'pendiente de verificar':'validada';$('ot').className='bg'+(n.ota?' w':'');
  $('dt').textContent=`${n.ssid||'portal'} · ${n.ip} · RAM mínima ${Math.round(n.min/1024)} KB · lecturas táctiles ${(n.tc/1000).toFixed(2)} ms (máx. ${(n.tcmax/1000).toFixed(2)} ms)`;
 }
+function peers(a){
+ const e=$('np');e.textContent='';
+ if(!a||!a.length){const d=document.createElement('div');d.className='p';d.textContent='Ninguna a la vista';e.appendChild(d);return}
+ for(const p of a){const d=document.createElement('div');d.className='p';
+  d.textContent=`${p.name} · ${p.mac} · ${p.rssi} dBm · hace ${p.age} s`;e.appendChild(d)}}
 function merge(j){
  const n=j.now;
  if(boot>=0&&n.boot!==boot){  // el ESP32 se reinició (por ejemplo, tras dormir): empezar de cero
@@ -1511,7 +1526,7 @@ function merge(j){
  for(const a of j.samples)if(a[0]>since){S.push({s:a[0],m:a[1],r:a[2],h:a[3],t:a.slice(4)});since=a[0]}
  const e=S.length?S[S.length-1].m:0;
  while(S.length&&(e-S[0].m>60000||S.length>240))S.shift();
- ulp=j.ulp;cards(n);draw();drawUlp();return 1}
+ ulp=j.ulp;cards(n);peers(j.peers);draw();drawUlp();return 1}
 async function poll(){
  let d=500;
  const c=new AbortController(),to=setTimeout(()=>c.abort(),4000);
@@ -1811,12 +1826,623 @@ void cryptoDemo() {
                   cryptoTestNames[worst], worstX);
 }
 
+// ---------- ESP-NOW ----------
+//
+// Comunicación directa entre placas, sin router, con la API cruda del ESP-IDF (esp_now.h).
+// Es una demo de LAN: los paquetes van sin cifrar. Se podría cifrar con una PMK global
+// (esp_now_set_pmk) y una LMK por peer (peer.encrypt y peer.lmk).
+// Los callbacks corren en la tarea de Wi-Fi, así que solo copian el paquete a una cola de
+// FreeRTOS; todo lo demás ocurre en espNowPoll(), que llaman loop() y los menús que esperan.
+// Las dos placas tienen que estar en el mismo canal: lo están si usan el mismo router.
+
+const uint16_t EN_MAGIC = 0xE532;
+const uint8_t EN_VERSION = 1;
+const size_t EN_MAX = 250;  // ESP_NOW_MAX_DATA_LEN
+const size_t EN_HDR = 12;
+const int EN_PEERS = 8;
+const uint32_t EN_BEACON_MS = 2000;
+const uint32_t EN_LOST_MS = 10000;  // sin balizas durante este tiempo, la placa se da por perdida
+const uint32_t EN_TOUCH_SAFETY_MS = 3000;
+const int EN_PINGS = 100;
+const uint32_t EN_BULK_MS = 2000;
+
+enum EnType : uint8_t { EN_BEACON = 1, EN_PING, EN_PONG, EN_CHAT, EN_LED, EN_TOUCH, EN_BULK, EN_BULK_REPORT };
+
+struct __attribute__((packed)) EnPacket {
+  uint16_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint32_t seq;
+  uint32_t ts;  // esp_timer_get_time() del emisor al enviar (µs, 32 bits)
+  uint8_t payload[EN_MAX - EN_HDR];
+};
+static_assert(sizeof(EnPacket) == EN_MAX, "EnPacket debe medir 250 bytes");
+
+struct __attribute__((packed)) EnBeacon { char name[20]; char fw[8]; uint32_t uptime; };
+struct __attribute__((packed)) EnChat { uint8_t len; char text[200]; };
+struct __attribute__((packed)) EnBulkHdr { uint16_t id; uint32_t index; };
+struct __attribute__((packed)) EnBulkReport { uint16_t id; uint32_t count; uint32_t spanUs; };
+
+struct EnRx {  // lo que los callbacks dejan en la cola
+  uint8_t mac[6];
+  int8_t rssi;
+  int64_t t;  // esp_timer_get_time() al recibir
+  uint8_t len;
+  EnPacket pkt;
+};
+
+struct EnPeer {
+  bool used;
+  bool present;  // false = se dio por perdida
+  uint8_t mac[6];
+  char name[20];
+  char fw[8];
+  int8_t rssi;
+  uint32_t seen;
+};
+
+const uint8_t EN_BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+QueueHandle_t enQueue = nullptr;
+bool enReady = false;
+uint8_t enChannel = 0;
+uint32_t enRetryAt = 0, enBeaconAt = 0, enCheckAt = 0, enSeq = 0;
+volatile uint32_t enTxOk = 0, enTxFail = 0, enRxDrop = 0;
+volatile bool enTxBusy = false;
+EnPeer enPeers[EN_PEERS];
+
+bool enPingOn = false;
+uint32_t enRtt[EN_PINGS];  // µs, 0 = sin respuesta
+
+bool enBulkWait = false, enBulkGot = false;  // emisor esperando el informe del receptor
+EnBulkReport enBulkRep;
+bool enRxActive = false;  // receptor contando una ráfaga
+uint8_t enRxMac[6];
+uint16_t enRxId = 0;
+uint32_t enRxCount = 0;
+int64_t enRxFirst = 0, enRxLast = 0;
+
+bool enTouchLocal = false;  // GPIO4 tocado (ya con antirrebote)
+bool enTouchCand = false;
+int enTouchRun = 0;
+uint32_t enTouchSeq = 0, enTouchSentAt = 0;
+bool enRemoteTouch = false;  // una placa vecina está tocando: el LED queda fijo
+LedMode enTouchPrev = LED_OFF;
+uint32_t enRemoteTouchAt = 0;
+
+void enOnRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (!enQueue || len < (int)EN_HDR || len > (int)EN_MAX) return;
+  EnRx r;
+  memcpy(r.mac, info->src_addr, 6);
+  r.rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0;
+  r.t = esp_timer_get_time();
+  r.len = len;
+  memset(&r.pkt, 0, sizeof(r.pkt));
+  memcpy(&r.pkt, data, len);
+  if (xQueueSend(enQueue, &r, 0) != pdTRUE) enRxDrop = enRxDrop + 1;
+}
+
+void enOnSent(const esp_now_send_info_t *, esp_now_send_status_t status) {
+  enTxBusy = false;
+  if (status == ESP_NOW_SEND_SUCCESS) enTxOk = enTxOk + 1;
+  else enTxFail = enTxFail + 1;
+}
+
+String enMac(const uint8_t *m) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return String(b);
+}
+
+// Copia solo bytes imprimibles: un vecino no puede colar códigos ANSI en el monitor
+void enClean(char *dst, const char *src, size_t srcLen, size_t dstSize) {
+  size_t n = 0;
+  for (size_t i = 0; i < srcLen && src[i] && n + 1 < dstSize; i++) {
+    uint8_t c = src[i];
+    if (c >= 0x20 && c != 0x7f) dst[n++] = c;
+  }
+  dst[n] = 0;
+}
+
+int enFind(const uint8_t *mac) {
+  for (int i = 0; i < EN_PEERS; i++)
+    if (enPeers[i].used && memcmp(enPeers[i].mac, mac, 6) == 0) return i;
+  return -1;
+}
+
+String enNameOf(const uint8_t *mac) {
+  int i = enFind(mac);
+  return i >= 0 ? String(enPeers[i].name) : enMac(mac);
+}
+
+bool enAddPeer(const uint8_t *mac) {
+  if (esp_now_is_peer_exist(mac)) return true;
+  esp_now_peer_info_t p = {};
+  memcpy(p.peer_addr, mac, 6);
+  p.channel = 0;  // el canal actual de la interfaz
+  p.ifidx = WIFI_IF_STA;
+  p.encrypt = false;
+  return esp_now_add_peer(&p) == ESP_OK;
+}
+
+void enReadChannel() {
+  uint8_t ch = 0;
+  wifi_second_chan_t sc;
+  if (esp_wifi_get_channel(&ch, &sc) == ESP_OK) enChannel = ch;
+}
+
+void espNowInit() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println(C_RED "  [esp-now] no pude iniciar ESP-NOW" C_RESET);
+    enRetryAt = millis() + 10000;
+    return;
+  }
+  if (!enQueue) enQueue = xQueueCreate(48, sizeof(EnRx));
+  esp_now_register_recv_cb(enOnRecv);
+  esp_now_register_send_cb(enOnSent);
+  if (!enAddPeer(EN_BCAST)) {
+    Serial.println(C_RED "  [esp-now] no pude registrar el peer de difusión" C_RESET);
+    esp_now_deinit();
+    enRetryAt = millis() + 10000;
+    return;
+  }
+  memset(enPeers, 0, sizeof(enPeers));
+  enReadChannel();
+  enReady = true;
+  enBeaconAt = millis();
+  enCheckAt = millis() + 1000;
+  Serial.printf(C_GREEN "  [esp-now] listo en el canal %d como %s" C_RESET "\n", enChannel, HOSTNAME);
+}
+
+bool enSend(const uint8_t *mac, uint8_t type, const void *pl, size_t plen, uint32_t seq, uint32_t ts) {
+  if (!enReady || plen > sizeof(EnPacket::payload)) return false;
+  EnPacket p;
+  p.magic = EN_MAGIC;
+  p.version = EN_VERSION;
+  p.type = type;
+  p.seq = seq;
+  p.ts = ts;
+  if (plen) memcpy(p.payload, pl, plen);
+  enTxBusy = true;
+  if (esp_now_send(mac, (const uint8_t *)&p, EN_HDR + plen) != ESP_OK) {
+    enTxBusy = false;
+    return false;
+  }
+  return true;
+}
+
+bool enSendNew(const uint8_t *mac, uint8_t type, const void *pl, size_t plen) {
+  return enSend(mac, type, pl, plen, ++enSeq, (uint32_t)esp_timer_get_time());
+}
+
+void enBeaconSend() {
+  EnBeacon b = {};
+  strlcpy(b.name, HOSTNAME, sizeof(b.name));
+  strlcpy(b.fw, FW_VERSION, sizeof(b.fw));
+  b.uptime = millis() / 1000;
+  enSendNew(EN_BCAST, EN_BEACON, &b, sizeof(b));
+}
+
+// Con un vecino tocando, el LED queda fijo; al soltar vuelve el modo anterior
+void enRemoteTouchSet(bool on, const String &who) {
+  if (on) {
+    enRemoteTouchAt = millis() + EN_TOUCH_SAFETY_MS;
+    if (enRemoteTouch) return;
+    enRemoteTouch = true;
+    enTouchPrev = ledMode;
+    setLedMode(LED_OFF);  // suelta el PWM si estaba respirando
+    digitalWrite(LED_PIN, HIGH);
+    Serial.printf(C_MAGENTA "  [esp-now] %s está tocando GPIO4: LED fijo" C_RESET "\n", who.c_str());
+  } else if (enRemoteTouch) {
+    enRemoteTouch = false;
+    if (ledMode == LED_OFF) setLedMode(enTouchPrev);  // si alguien cambió el modo mientras tanto, se respeta
+    Serial.printf(C_MAGENTA "  [esp-now] %s: LED en modo %s" C_RESET "\n", who.c_str(), ledModeNames[ledMode]);
+  }
+}
+
+void enTouchLocalCheck() {
+  uint32_t now = millis();
+  if (!liveReady || liveHold || liveSeq == 0 || liveSeq == enTouchSeq) {
+    if (enTouchLocal && (int32_t)(now - enTouchSentAt) >= 1000) {  // mientras se mantiene, repetir para no caer en el límite de 3 s
+      enTouchSentAt = now;
+      uint8_t on = 1;
+      enSendNew(EN_BCAST, EN_TOUCH, &on, 1);
+    }
+    return;
+  }
+  enTouchSeq = liveSeq;
+  uint16_t v = liveBuf[(liveSeq - 1) % LIVE_N].touch[0];  // GPIO4 = touchPins[0]
+  bool t = v < liveBase[0] * 0.75f;                         // la misma regla del panel en vivo
+  if (t == enTouchCand) {
+    if (enTouchRun < 2) enTouchRun++;
+  } else {
+    enTouchCand = t;
+    enTouchRun = 1;
+  }
+  if (enTouchRun >= 2 && enTouchCand != enTouchLocal) {  // antirrebote: dos muestras seguidas (500 ms)
+    enTouchLocal = enTouchCand;
+    enTouchSentAt = now;
+    uint8_t on = enTouchLocal ? 1 : 0;
+    enSendNew(EN_BCAST, EN_TOUCH, &on, 1);
+    Serial.printf(C_MAGENTA "  [esp-now] %s GPIO4, aviso a las demás placas" C_RESET "\n", enTouchLocal ? "toqué" : "solté");
+  }
+}
+
+void enHandleBeacon(const EnRx &r) {
+  EnBeacon b;
+  memcpy(&b, r.pkt.payload, sizeof(b));
+  int i = enFind(r.mac);
+  if (i < 0) {
+    for (int k = 0; k < EN_PEERS && i < 0; k++)
+      if (!enPeers[k].used) i = k;
+    for (int k = 0; k < EN_PEERS && i < 0; k++)
+      if (!enPeers[k].present) {  // reemplaza a una placa ya perdida
+        esp_now_del_peer(enPeers[k].mac);
+        i = k;
+      }
+    if (i < 0) return;  // tabla llena
+    memset(&enPeers[i], 0, sizeof(EnPeer));
+    enPeers[i].used = true;
+    memcpy(enPeers[i].mac, r.mac, 6);
+  }
+  EnPeer &p = enPeers[i];
+  bool appeared = !p.present;
+  enClean(p.name, b.name, sizeof(b.name), sizeof(p.name));
+  enClean(p.fw, b.fw, sizeof(b.fw), sizeof(p.fw));
+  if (!p.name[0]) strlcpy(p.name, enMac(r.mac).c_str(), sizeof(p.name));
+  p.rssi = r.rssi;
+  p.seen = millis();
+  p.present = true;
+  if (appeared) {
+    enAddPeer(r.mac);
+    Serial.printf(C_GREEN "  [esp-now] encontré a %s (%s, %d dBm)" C_RESET "\n", p.name, enMac(r.mac).c_str(), p.rssi);
+  }
+}
+
+void enHandle(const EnRx &r) {
+  const EnPacket &k = r.pkt;
+  if (k.magic != EN_MAGIC || k.version != EN_VERSION) return;
+  if (k.type == EN_BEACON) {
+    enHandleBeacon(r);
+    return;
+  }
+  int pi = enFind(r.mac);
+  if (pi >= 0) {  // cualquier paquete válido de una placa conocida cuenta como señal de vida
+    enPeers[pi].seen = millis();
+    enPeers[pi].rssi = r.rssi;
+  }
+  switch (k.type) {
+    case EN_PING:
+      enAddPeer(r.mac);
+      enSend(r.mac, EN_PONG, nullptr, 0, k.seq, k.ts);  // devuelve la marca original
+      break;
+    case EN_PONG:
+      if (enPingOn && k.seq < EN_PINGS && enRtt[k.seq] == 0) enRtt[k.seq] = max<uint32_t>((uint32_t)r.t - k.ts, 1);
+      break;
+    case EN_CHAT: {
+      EnChat c;
+      memcpy(&c, k.payload, sizeof(c));
+      char text[sizeof(c.text) + 1];
+      enClean(text, c.text, min<size_t>(c.len, sizeof(c.text)), sizeof(text));
+      Serial.printf(C_MAGENTA "  [esp-now] %s: %s" C_RESET "\n", enNameOf(r.mac).c_str(), text);
+      break;
+    }
+    case EN_LED:
+      if (enRemoteTouch) enTouchPrev = (LedMode)((enTouchPrev + 1) % 3);  // el LED está fijo por un toque: cambia el modo que volverá
+      else setLedMode((LedMode)((ledMode + 1) % 3));
+      Serial.printf(C_MAGENTA "  [esp-now] %s cambió mi LED a: %s" C_RESET "\n", enNameOf(r.mac).c_str(),
+                    ledModeNames[enRemoteTouch ? enTouchPrev : ledMode]);
+      break;
+    case EN_TOUCH:
+      enRemoteTouchSet(k.payload[0] != 0, enNameOf(r.mac));
+      break;
+    case EN_BULK: {
+      EnBulkHdr h;
+      memcpy(&h, k.payload, sizeof(h));
+      if (!enRxActive || h.id != enRxId || memcmp(enRxMac, r.mac, 6) != 0) {  // ráfaga nueva
+        enAddPeer(r.mac);
+        enRxActive = true;
+        enRxId = h.id;
+        memcpy(enRxMac, r.mac, 6);
+        enRxCount = 0;
+        enRxFirst = r.t;
+      }
+      enRxCount++;
+      enRxLast = r.t;
+      break;
+    }
+    case EN_BULK_REPORT:
+      if (enBulkWait) {
+        memcpy(&enBulkRep, k.payload, sizeof(enBulkRep));
+        enBulkGot = true;
+      }
+      break;
+  }
+}
+
+void espNowPoll() {
+  uint32_t now = millis();
+  if (enRemoteTouch && (int32_t)(now - enRemoteTouchAt) >= 0) enRemoteTouchSet(false, "sin señal de soltar");  // límite por si se pierde el paquete de soltar
+  bool sta = WiFi.getMode() & WIFI_STA;
+  if (enReady && !sta) {  // alguien apagó el Wi-Fi: ESP-NOW se cae con él
+    esp_now_deinit();
+    enReady = false;
+    memset(enPeers, 0, sizeof(enPeers));
+  }
+  if (!enReady) {
+    if (sta && (WiFi.status() == WL_CONNECTED || portalActive) && (int32_t)(now - enRetryAt) >= 0) espNowInit();
+    if (!enReady) return;
+  }
+
+  if ((int32_t)(now - enCheckAt) >= 0) {
+    enCheckAt = now + 1000;
+    uint8_t before = enChannel;
+    enReadChannel();
+    if (enChannel != before) Serial.printf(C_DIM "  [esp-now] canal %d" C_RESET "\n", enChannel);
+    for (int i = 0; i < EN_PEERS; i++)
+      if (enPeers[i].used && enPeers[i].present && now - enPeers[i].seen > EN_LOST_MS) {
+        enPeers[i].present = false;
+        Serial.printf(C_YELLOW "  [esp-now] perdí a %s (sin balizas hace %lu s)" C_RESET "\n", enPeers[i].name,
+                      (unsigned long)((now - enPeers[i].seen) / 1000));
+      }
+  }
+  if ((int32_t)(now - enBeaconAt) >= 0) {
+    enBeaconAt = now + EN_BEACON_MS;
+    enBeaconSend();
+  }
+
+  EnRx r;
+  while (xQueueReceive(enQueue, &r, 0) == pdTRUE) enHandle(r);
+
+  if (enRxActive && esp_timer_get_time() - enRxLast > 300000) {  // la ráfaga terminó: informar al emisor
+    EnBulkReport rep = {enRxId, enRxCount, (uint32_t)max<int64_t>(enRxLast - enRxFirst, 1)};
+    enSendNew(enRxMac, EN_BULK_REPORT, &rep, sizeof(rep));
+    Serial.printf(C_DIM "  [esp-now] recibí una ráfaga de %lu paquetes de %s" C_RESET "\n", (unsigned long)enRxCount,
+                  enNameOf(enRxMac).c_str());
+    enRxActive = false;
+  }
+  enTouchLocalCheck();
+}
+
+void espNowPeersJson(String &j) {
+  j += '[';
+  bool first = true;
+  for (int i = 0; i < EN_PEERS; i++) {
+    if (!enPeers[i].used || !enPeers[i].present) continue;
+    if (!first) j += ',';
+    first = false;
+    j += "{\"name\":";
+    jsonStr(j, enPeers[i].name);
+    char b[80];
+    snprintf(b, sizeof(b), ",\"mac\":\"%s\",\"rssi\":%d,\"age\":%lu}", enMac(enPeers[i].mac).c_str(), enPeers[i].rssi,
+             (unsigned long)((millis() - enPeers[i].seen) / 1000));
+    j += b;
+  }
+  j += ']';
+}
+
+// El mismo trabajo de fondo que hace loop(), para los menús que esperan una tecla
+void enBackground() {
+  if (portalActive) dns.processNextRequest();
+  if (serverStarted) server.handleClient();
+  if (otaStarted) ArduinoOTA.handle();
+  updateConnection();
+  otaHealthCheck();
+  if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
+  updateLed();
+  liveSample();
+  espNowPoll();
+}
+
+char enWaitKey() {
+  flushInput();
+  while (!Serial.available()) {
+    enBackground();
+    delay(5);
+  }
+  char c = tolower(Serial.read());
+  flushInput();
+  return c;
+}
+
+void enPing(const uint8_t *mac, const char *name) {
+  header("ESP-NOW: ping");
+  Serial.printf("  %d paquetes a %s, uno cada 20 ms...\n", EN_PINGS, name);
+  memset(enRtt, 0, sizeof(enRtt));
+  enPingOn = true;
+  for (int i = 0; i < EN_PINGS; i++) {
+    enSend(mac, EN_PING, nullptr, 0, i, (uint32_t)esp_timer_get_time());
+    uint32_t until = millis() + 20;
+    while ((int32_t)(millis() - until) < 0) {
+      enBackground();
+      delay(1);
+    }
+  }
+  uint32_t until = millis() + 300;  // rezagados
+  while ((int32_t)(millis() - until) < 0) {
+    enBackground();
+    delay(1);
+  }
+  enPingOn = false;
+
+  const uint32_t edges[] = {2000, 3000, 4000, 6000, 10000, 20000, 50000};  // µs
+  const int nb = sizeof(edges) / sizeof(edges[0]) + 1;
+  int hist[nb] = {0};
+  int got = 0;
+  uint32_t mn = UINT32_MAX, mx = 0;
+  uint64_t sum = 0;
+  for (int i = 0; i < EN_PINGS; i++) {
+    uint32_t v = enRtt[i];
+    if (!v) continue;
+    got++;
+    sum += v;
+    mn = min(mn, v);
+    mx = max(mx, v);
+    int b = 0;
+    while (b < nb - 1 && v >= edges[b]) b++;
+    hist[b]++;
+  }
+  Serial.printf("  Respuestas   : %d de %d\n", got, EN_PINGS);
+  Serial.printf("  Pérdida      : %s%d %%" C_RESET "\n", got == EN_PINGS ? C_GREEN : C_YELLOW, (EN_PINGS - got) * 100 / EN_PINGS);
+  if (!got) return;
+  Serial.printf("  RTT          : mín %.2f ms, prom %.2f ms, máx %.2f ms\n", mn / 1000.0, sum / (double)got / 1000.0, mx / 1000.0);
+  int hmax = 1;
+  for (int b = 0; b < nb; b++) hmax = max(hmax, hist[b]);
+  Serial.println("\n  Distribución del RTT:");
+  for (int b = 0; b < nb; b++) {
+    if (b == 0) Serial.printf("   < %2lu ms    ", (unsigned long)(edges[0] / 1000));
+    else if (b < nb - 1) Serial.printf("   %2lu a %2lu ms ", (unsigned long)(edges[b - 1] / 1000), (unsigned long)(edges[b] / 1000));
+    else Serial.printf("   >= %2lu ms   ", (unsigned long)(edges[b - 1] / 1000));
+    bar(hist[b], hmax, 30, b < 3 ? C_GREEN : b < 5 ? C_YELLOW : C_RED);
+    Serial.printf(" %d\n", hist[b]);
+  }
+}
+
+void enThroughput(const uint8_t *mac, const char *name) {
+  header("ESP-NOW: velocidad");
+  Serial.printf("  Ráfaga de %lu s de paquetes de %d bytes hacia %s...\n", (unsigned long)(EN_BULK_MS / 1000), (int)EN_MAX, name);
+  uint8_t pl[sizeof(EnPacket::payload)];
+  memset(pl, 0xA5, sizeof(pl));
+  EnBulkHdr h = {(uint16_t)(esp_random() & 0xFFFF), 0};
+  enBulkGot = false;
+  enBulkWait = true;
+  uint32_t ok0 = enTxOk, fail0 = enTxFail;
+  int64_t t0 = esp_timer_get_time();
+  while (esp_timer_get_time() - t0 < (int64_t)EN_BULK_MS * 1000) {
+    uint32_t w = millis();
+    while (enTxBusy && millis() - w < 20) delayMicroseconds(50);  // un paquete a la vez: espera el resultado del anterior
+    memcpy(pl, &h, sizeof(h));
+    h.index++;
+    if (!enSend(mac, EN_BULK, pl, sizeof(pl), h.index, (uint32_t)esp_timer_get_time())) delay(1);
+    espNowPoll();
+  }
+  double secs = (esp_timer_get_time() - t0) / 1e6;
+  uint32_t w = millis();
+  while (enTxBusy && millis() - w < 50) delayMicroseconds(100);
+  uint32_t ok = enTxOk - ok0, fail = enTxFail - fail0;
+  uint32_t until = millis() + 1500;  // el receptor informa 300 ms después del último paquete
+  while (!enBulkGot && (int32_t)(millis() - until) < 0) {
+    enBackground();
+    delay(2);
+  }
+  enBulkWait = false;
+  Serial.printf("  Enviados     : %lu paquetes confirmados, %lu fallidos, en %.2f s\n", (unsigned long)ok, (unsigned long)fail, secs);
+  Serial.printf("  Velocidad    : " C_BOLD "%.1f kB/s" C_RESET " enviados\n", ok * (double)EN_MAX / 1024.0 / secs);
+  if (!enBulkGot || enBulkRep.id != h.id) {
+    Serial.printf(C_YELLOW "  %s no mandó el informe de lo que recibió." C_RESET "\n", name);
+    return;
+  }
+  double rxRate = enBulkRep.count * (double)EN_MAX / 1024.0 / (enBulkRep.spanUs / 1e6);
+  double loss = ok ? max(0.0, 100.0 * ((double)ok - enBulkRep.count) / ok) : 100.0;
+  Serial.printf("  %-13.13s: %lu paquetes recibidos, " C_BOLD "%.1f kB/s" C_RESET "\n", name, (unsigned long)enBulkRep.count, rxRate);
+  Serial.printf("  Pérdida      : %s%.1f %%" C_RESET "\n", loss < 1 ? C_GREEN : C_YELLOW, loss);
+}
+
+void enChat(const uint8_t *mac, const char *name) {
+  header("ESP-NOW: chat");
+  Serial.printf("  Escribe y pulsa Enter para mandar a %s. Una línea vacía o ESC sale.\n", name);
+  flushInput();
+  String line;
+  bool lastCr = false;
+  Serial.print("  > ");
+  for (;;) {
+    enBackground();
+    if (!Serial.available()) {
+      delay(2);
+      continue;
+    }
+    int c = Serial.read();
+    if (c == 27) {
+      Serial.println();
+      break;
+    }
+    if (c == '\n' && lastCr) {  // el \n de un \r\n
+      lastCr = false;
+      continue;
+    }
+    lastCr = c == '\r';
+    if (c == '\r' || c == '\n') {
+      Serial.println();
+      if (line.isEmpty()) break;
+      EnChat m = {};
+      m.len = line.length();
+      memcpy(m.text, line.c_str(), m.len);
+      if (!enSendNew(mac, EN_CHAT, &m, 1 + m.len)) Serial.println(C_RED "  No pude enviar el mensaje." C_RESET);
+      line = "";
+      Serial.print("  > ");
+    } else if (c == 8 || c == 127) {
+      if (line.length()) {
+        line.remove(line.length() - 1);
+        Serial.print("\b \b");
+      }
+    } else if (c >= 0x20 && line.length() < sizeof(EnChat::text)) {
+      line += (char)c;
+      Serial.write(c);
+    }
+  }
+  flushInput();
+}
+
+void espNowMenu() {
+  header("ESP-NOW: comunicación directa entre placas");
+  if (!enReady) {
+    Serial.println("  Todavía no está activo: necesita el Wi-Fi encendido (conectado o con el portal abierto).");
+    return;
+  }
+  Serial.printf("  Esta placa   : " C_BOLD "%s" C_RESET ", canal %d\n", HOSTNAME, enChannel);
+  if (enRxDrop) Serial.printf("  Paquetes descartados por la cola llena: %lu\n", (unsigned long)enRxDrop);
+  int idx[EN_PEERS], n = 0;
+  for (int i = 0; i < EN_PEERS; i++)
+    if (enPeers[i].used && enPeers[i].present) idx[n++] = i;
+  if (!n) {
+    Serial.println("  No veo otras placas. Se anuncian cada 2 s y deben estar en el mismo canal.");
+    return;
+  }
+  Serial.println("\n  Placas a la vista:");
+  uint32_t now = millis();
+  for (int k = 0; k < n; k++) {
+    const EnPeer &p = enPeers[idx[k]];
+    Serial.printf("  %d) %-18.18s %s  ", k + 1, p.name, enMac(p.mac).c_str());
+    bar(p.rssi + 100, 70, 12, p.rssi > -60 ? C_GREEN : p.rssi > -75 ? C_YELLOW : C_RED);
+    Serial.printf(" %4d dBm  hace %lu s  v%s\n", p.rssi, (unsigned long)((now - p.seen) / 1000), p.fw);
+  }
+  int sel = 0;
+  if (n > 1) {
+    Serial.printf(C_BOLD "\n  ¿Con cuál? Pulsa 1 a %d, o cualquier otra tecla para salir." C_RESET "\n", n);
+    char c = enWaitKey();
+    if (c < '1' || c > '0' + n) return;
+    sel = c - '1';
+  }
+  uint8_t mac[6];
+  char name[20];
+  memcpy(mac, enPeers[idx[sel]].mac, 6);
+  strlcpy(name, enPeers[idx[sel]].name, sizeof(name));
+  Serial.printf(C_BOLD "\n  Con %s:" C_RESET "\n", name);
+  Serial.println("  " C_YELLOW "1" C_RESET "  ping: 100 paquetes, pérdida y tiempo de ida y vuelta");
+  Serial.println("  " C_YELLOW "2" C_RESET "  velocidad: ráfaga de 2 s");
+  Serial.println("  " C_YELLOW "3" C_RESET "  chat");
+  Serial.println("  " C_YELLOW "4" C_RESET "  cambiar el modo de su LED");
+  Serial.println(C_DIM "  Cualquier otra tecla sale." C_RESET);
+  switch (enWaitKey()) {
+    case '1': enPing(mac, name); break;
+    case '2': enThroughput(mac, name); break;
+    case '3': enChat(mac, name); break;
+    case '4':
+      if (enSendNew(mac, EN_LED, nullptr, 0)) Serial.printf("  Pedí a %s que cambie su LED.\n", name);
+      else Serial.println(C_RED "  No pude enviar la orden." C_RESET);
+      break;
+    default: break;
+  }
+}
+
 // ---------- arranque y bucle ----------
 
 void setup() {
   Serial.begin(115200);
   delay(300);
   bootCount++;
+  uint8_t staMac[6];
+  esp_read_mac(staMac, ESP_MAC_WIFI_STA);
+  snprintf(HOSTNAME, sizeof(HOSTNAME), "esp32-demo-%02x%02x", staMac[4], staMac[5]);  // una sola vez: dos placas no deben llamarse igual
   rtc_gpio_deinit(GPIO_NUM_2);  // por si el ULP lo dejó en el dominio RTC
   setLedMode(LED_OFF);
 
@@ -1847,6 +2473,7 @@ void setup() {
   }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
   Serial.println("\n\n" C_BOLD C_GREEN "ESP32 listo." C_RESET);
+  Serial.printf("  Nombre: " C_BOLD "%s" C_RESET "\n", HOSTNAME);
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   if (ulpPending && (cause == ESP_SLEEP_WAKEUP_ULP || cause == ESP_SLEEP_WAKEUP_TIMER))
     showUlpResults(cause);
@@ -1875,6 +2502,7 @@ void loop() {
   if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
   updateLed();
   liveSample();
+  espNowPoll();
 
   if (!Serial.available()) {
     delay(2);
@@ -1908,6 +2536,7 @@ void loop() {
     case 'u': ulpDemo(); break;
     case 'o': otaMenu(); break;
     case 'e': cryptoDemo(); break;
+    case 'p': espNowMenu(); break;
     case 'h': case '?': printMenu(); break;
     case '\r': case '\n': case ' ': return;
     default: Serial.printf("\n  Tecla '%c' no reconocida. Pulsa h para ver el menú.\n", c); return;

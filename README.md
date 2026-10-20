@@ -20,6 +20,7 @@ Firmware para explorar lo que un ESP32 puede hacer por sí solo, sin conectarle 
 | `u` | Coprocesador ULP: lecturas táctiles mientras el CPU principal duerme |
 | `o` | Actualizaciones OTA: ranuras, versiones, estado de la imagen y rollback manual |
 | `e` | Cifrado por hardware: AES-128/256 en modo CBC y SHA-256 contra una implementación por software con tablas (con autoverificación FIPS y MB/s de cada lado) |
+| `p` | ESP-NOW: comunicación directa entre placas (ping, velocidad, chat y LED remoto) |
 | `h` | Menú |
 
 ### Configuración Wi-Fi con portal cautivo
@@ -30,14 +31,15 @@ Funciona como muchos dispositivos IoT comerciales:
 2. Al conectarte desde el celular se abre sola la página de configuración. Si no aparece, entra a `http://192.168.4.1`.
 3. Eliges tu red, escribes la contraseña y la página muestra si la conexión funcionó o por qué falló (contraseña incorrecta, red no encontrada, etc.).
 4. Las credenciales se guardan en la memoria NVS del ESP32, y solo cuando la conexión fue exitosa. En los siguientes arranques se conecta solo.
-5. Ya conectado, hay un panel web en `http://esp32-demo.local` o en la IP que se muestra en el monitor serie.
+5. Ya conectado, hay un panel web en `http://esp32-demo-xxxx.local` (el nombre de cada placa se muestra en el monitor serie) o en la IP que se muestra en el monitor serie.
 
 Las credenciales nunca salen del ESP32 ni se imprimen en el monitor serie (solo se muestra el largo de la contraseña).
 
 ### Gráficas en vivo
 
-`http://esp32-demo.local/live` (o el botón "Gráficas en vivo" del panel; sin contraseña, como el panel) dibuja en el navegador, sin librerías ni internet, así que también abre desde el portal ESP32-Setup:
+`http://esp32-demo-xxxx.local/live` (o el botón "Gráficas en vivo" del panel; sin contraseña, como el panel) dibuja en el navegador, sin librerías ni internet, así que también abre desde el portal ESP32-Setup:
 
+- Una tarjeta "Placas ESP-NOW" con las placas vecinas (nombre, MAC, señal y hace cuánto se vieron).
 - Tarjetas con encendido, señal Wi-Fi, RAM libre, modo del LED, versión del firmware y si la imagen está pendiente de verificar.
 - Caída del sensor táctil de los 8 pines en los últimos 60 s, con una barra por pin que se pone verde y dice "TOCADO" con la misma regla de `t` (caída de más del 25 % contra la base).
 - Señal Wi-Fi y RAM libre en los últimos 60 s.
@@ -60,13 +62,13 @@ El ESP32 se puede actualizar por Wi-Fi, desde el PC (espota) o desde el navegado
 pio run -e esp32dev-ota -t upload
 ```
 
-Usa `esp32-demo.local` como destino. Si tu red no resuelve mDNS, indica la IP: `pio run -e esp32dev-ota -t upload --upload-port 192.168.1.50`. Con una contraseña incorrecta el ESP32 rechaza la actualización.
+Cada placa se llama `esp32-demo-xxxx` (los últimos 2 bytes de su MAC en hexadecimal minúscula), así que hay que indicar el destino: `pio run -e esp32dev-ota -t upload --upload-port <ip o esp32-demo-xxxx.local>`. Si tu red no resuelve mDNS, usa la IP. Con una contraseña incorrecta el ESP32 rechaza la actualización.
 
 En Windows, espota necesita que el firewall permita las conexiones entrantes a `python.exe` (el ESP32 se conecta de vuelta al PC para pedir el archivo). Si la actualización se queda en "Waiting for device", revisa esa regla.
 
 **Desde el navegador**
 
-Abre `http://esp32-demo.local/update` (o el enlace "Actualizar firmware" del panel), entra con usuario `admin` y la contraseña de `secrets.ini`, y sube el archivo `.pio/build/esp32dev/firmware.bin`. Sin credenciales responde 401.
+Abre `http://esp32-demo-xxxx.local/update` (o el enlace "Actualizar firmware" del panel), entra con usuario `admin` y la contraseña de `secrets.ini`, y sube el archivo `.pio/build/esp32dev/firmware.bin`. Sin credenciales responde 401.
 
 **Rollback automático**
 
@@ -75,6 +77,18 @@ Una imagen recién actualizada arranca "pendiente de verificar". Se valida sola 
 Para probarlo, sube la imagen defectuosa: `pio run -e esp32dev-ota-faulty -t upload`. Se cae a los ~5 s de arrancar y el ESP32 regresa a la versión anterior. (Solo se cae si llegó por OTA; grabada por USB funciona normal.)
 
 La tecla `o` muestra la ranura en uso, la otra ranura, las versiones, el estado de la imagen y el último rollback, y con `v` permite volver a la versión anterior a mano.
+
+### ESP-NOW entre placas
+
+Con dos o más placas en el mismo router, la tecla `p` usa ESP-NOW (API cruda `esp_now.h`) para hablar de placa a placa sin pasar por el router. Funciona solo si las placas están en el mismo canal de Wi-Fi, y arranca cuando el Wi-Fi está conectado o el portal está abierto. Es una demo de LAN: no hay cifrado (se podría agregar con PMK y LMK).
+
+- **Hostname único:** cada placa se llama `esp32-demo-xxxx` (últimos 2 bytes de la MAC), para que mDNS y OTA no choquen.
+- **Descubrimiento:** cada 2 s se anuncia una baliza con el nombre, la versión y el tiempo encendida. Hasta 8 placas en la tabla; aparece `[esp-now] encontré a <nombre>` y un aviso si dejan de anunciarse 10 s.
+- **Menú `p`:** lista las placas (nombre, MAC, señal, hace cuánto) y, tras elegir una si hay varias, ofrece: `1` ping (100 paquetes, pérdida y RTT mín/prom/máx con histograma), `2` velocidad (ráfaga de 2 s de paquetes de 250 bytes, kB/s enviados y recibidos, pérdida), `3` chat (línea vacía o ESC para salir; los mensajes entrantes se imprimen en cualquier momento) y `4` cambiar el modo del LED de la otra placa. Cualquier otra tecla sale.
+- **Toque remoto:** al tocar GPIO4 (misma regla del panel en vivo) se avisa a las demás placas, cuyo LED queda fijo mientras dura el toque y luego vuelve a su modo. Si se pierde el aviso de soltar, el LED se restablece solo a los 3 s.
+- `/api/live` incluye `peers` y `/live` muestra la tarjeta "Placas ESP-NOW".
+
+Los paquetes tienen cabecera (magic, versión, tipo, número y marca de tiempo) y un máximo de 250 bytes. Los callbacks del Wi-Fi solo encolan; el procesamiento ocurre en `loop()`.
 
 ### Coprocesador ULP
 
