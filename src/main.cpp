@@ -843,12 +843,12 @@ void otaBoot() {
     uint32_t id = (d.app_elf_sha256[0] << 24) | (d.app_elf_sha256[1] << 16) | (d.app_elf_sha256[2] << 8) | d.app_elf_sha256[3];
     if (prefs.getUInt("rbsha", 0) != id) {
       prefs.putUInt("rbsha", id);
-      Serial.printf(C_YELLOW C_BOLD "  [ota] ROLLBACK: la imagen de %s (compilada %s %s) falló antes de validarse." C_RESET "\n",
-                    bad->label, d.date, d.time);
+      Serial.printf(C_YELLOW C_BOLD "  [ota] ROLLBACK: la imagen de %s (SHA %02x%02x%02x%02x) falló antes de validarse." C_RESET "\n",
+                    bad->label, d.app_elf_sha256[0], d.app_elf_sha256[1], d.app_elf_sha256[2], d.app_elf_sha256[3]);
       Serial.printf(C_YELLOW "  [ota] volví a la versión anterior (%s)." C_RESET "\n", esp_ota_get_running_partition()->label);
     }
   } else {
-    prefs.remove("rbsha");
+    if (prefs.isKey("rbsha")) prefs.remove("rbsha");
   }
   prefs.end();
 
@@ -1028,7 +1028,8 @@ void otaMenu() {
   const esp_partition_t *other = esp_ota_get_next_update_partition(nullptr);
   const esp_app_desc_t *me = esp_app_get_description();
   Serial.printf("  Ejecutando   : %s en 0x%lX (%lu KB)\n", run->label, (unsigned long)run->address, (unsigned long)(run->size / 1024));
-  Serial.printf("  Versión      : " C_BOLD "%s" C_RESET ", compilada %s (descripción de la app: %s %s %s)\n", FW_VERSION, FW_BUILD, me->version, me->date, me->time);
+  Serial.printf("  Versión      : " C_BOLD "%s" C_RESET ", compilada %s, SHA %02x%02x%02x%02x\n", FW_VERSION, FW_BUILD,
+                me->app_elf_sha256[0], me->app_elf_sha256[1], me->app_elf_sha256[2], me->app_elf_sha256[3]);
   if (otaPending) {
     Serial.printf("  Estado       : " C_YELLOW "pendiente de verificar" C_RESET " (límite en %lu s, necesita %lu s estables%s)\n",
                   (unsigned long)(OTA_DEADLINE_MS > millis() ? (OTA_DEADLINE_MS - millis()) / 1000 : 0),
@@ -1041,7 +1042,7 @@ void otaMenu() {
     Serial.printf("  Otra ranura  : %s en 0x%lX (%lu KB), %s\n", other->label, (unsigned long)other->address,
                   (unsigned long)(other->size / 1024), otaStateStr(other));
     if (esp_ota_get_partition_description(other, &d) == ESP_OK)
-      Serial.printf("  Su versión   : %s, compilada %s %s\n", d.version, d.date, d.time);
+      Serial.printf("  Su versión   : SHA %02x%02x%02x%02x\n", d.app_elf_sha256[0], d.app_elf_sha256[1], d.app_elf_sha256[2], d.app_elf_sha256[3]);
     else
       Serial.println("  Su versión   : vacía (no hay ninguna imagen)");
   }
