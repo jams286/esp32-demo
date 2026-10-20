@@ -10,6 +10,9 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
 #include <Preferences.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
@@ -31,6 +34,15 @@
 #include <vector>
 
 #define LED_PIN 2
+
+#define FW_VERSION "1.1.0"
+#define FW_BUILD __DATE__ " " __TIME__
+
+// La contraseña viene de secrets.ini (ver README); sin ella no se compila
+#ifndef OTA_PASSWORD
+#error "Falta OTA_PASSWORD: crea secrets.ini a partir de secrets.ini.example"
+#endif
+static_assert(sizeof(OTA_PASSWORD) > 8, "OTA_PASSWORD debe tener al menos 8 caracteres");
 
 #define C_RESET   "\033[0m"
 #define C_BOLD    "\033[1m"
@@ -157,6 +169,7 @@ void printMenu() {
   Serial.printf ("  " C_YELLOW "l" C_RESET "  cambiar modo del LED azul (ahora: %s)\n", ledModeNames[ledMode]);
   Serial.println("  " C_YELLOW "s" C_RESET "  deep sleep 10 s y despertar solo");
   Serial.println("  " C_YELLOW "u" C_RESET "  coprocesador ULP: LED y sensor táctil mientras el CPU duerme");
+  Serial.println("  " C_YELLOW "o" C_RESET "  actualizaciones OTA: versión, particiones y rollback");
   Serial.println("  " C_YELLOW "h" C_RESET "  este menú");
 }
 
@@ -265,6 +278,7 @@ void startConnect(const String &ssid, const String &pass, bool fromPortal) {
 }
 
 void startPortal();
+void startOta();
 
 void updateConnection() {
   bool up = WiFi.status() == WL_CONNECTED;
@@ -289,6 +303,7 @@ void updateConnection() {
         MDNS.addService("http", "tcp", 80);
         mdnsStarted = true;
       }
+      startOta();
       Serial.printf("  Desde tu red abre " C_BOLD "http://%s" C_RESET " o " C_BOLD "http://%s.local" C_RESET "\n",
                     ip.c_str(), HOSTNAME);
     } else if (lastDisconnectReason != 0 || millis() - connStartedAt > CONNECT_TIMEOUT_MS) {
@@ -510,7 +525,8 @@ void handlePanel() {
   }
   b += "<tr><td>LED</td><td>" + String(ledModeNames[ledMode]) + "</td></tr>";
   b += "<tr><td>Arranques</td><td>" + String(bootCount) + "</td></tr>";
-  b += "</table><a class='btn' href='/led'>Cambiar LED</a>";
+  b += "<tr><td>Firmware</td><td>" FW_VERSION "</td></tr>";
+  b += "</table><a class='btn' href='/led'>Cambiar LED</a><a class='btn' href='/update'>Actualizar firmware</a>";
   sendPage(b);
 }
 
@@ -768,9 +784,313 @@ void handleLed() {
   server.send(303);
 }
 
+// ---------- OTA ----------
+//
+// Hay dos ranuras de aplicación (ota_0 y ota_1). Una actualización se escribe en la ranura
+// libre y arranca "pendiente de verificar": si el chip se reinicia antes de que se valide,
+// el bootloader vuelve solo a la imagen anterior.
+
+const uint32_t OTA_STABLE_MS = 30000;    // tiempo estable antes de validar la imagen
+const uint32_t OTA_DEADLINE_MS = 90000;  // si sigue sin validarse, se hace rollback explícito
+
+// Sin esto el core marca la imagen como válida nada más arrancar
+extern "C" bool verifyRollbackLater() { return true; }
+
+bool otaPending = false;     // la imagen en ejecución espera su validación
+bool otaNeedsWifi = false;   // hay red guardada, así que la validación exige Wi-Fi
+bool otaStarted = false;
+bool otaBusy = false;        // recibiendo una actualización
+LedMode otaLedBefore = LED_OFF;
+String webUpdateError;
+bool webUpdating = false;
+bool webUpdateOk = false;
+
+const char *otaStateStr(const esp_partition_t *p) {
+  esp_ota_img_states_t s;
+  if (esp_ota_get_state_partition(p, &s) != ESP_OK) return "sin estado (arranque normal)";
+  switch (s) {
+    case ESP_OTA_IMG_NEW:            return "nueva";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "pendiente de verificar";
+    case ESP_OTA_IMG_VALID:          return "válida";
+    case ESP_OTA_IMG_INVALID:        return "inválida (revertida)";
+    case ESP_OTA_IMG_ABORTED:        return "abortada (revertida)";
+    default:                         return "sin estado (arranque normal)";
+  }
+}
+
+// La ranura puede volver a la que se revirtió: tiene que ser una imagen y no estar marcada como mala
+bool otaSlotUsable(const esp_partition_t *p) {
+  esp_app_desc_t d;
+  if (!p || esp_ota_get_partition_description(p, &d) != ESP_OK) return false;
+  esp_ota_img_states_t s;
+  if (esp_ota_get_state_partition(p, &s) == ESP_OK && (s == ESP_OTA_IMG_INVALID || s == ESP_OTA_IMG_ABORTED)) return false;
+  return true;
+}
+
+// Se llama una vez al arrancar: detecta si la imagen está pendiente y si hubo un rollback
+void otaBoot() {
+  esp_ota_img_states_t s;
+  otaPending = esp_ota_get_state_partition(esp_ota_get_running_partition(), &s) == ESP_OK && s == ESP_OTA_IMG_PENDING_VERIFY;
+  String ssid, pass;
+  otaNeedsWifi = loadCredentials(ssid, pass);
+
+  // Se avisa una sola vez por rollback: se recuerda la imagen mala en la NVS y se olvida
+  // cuando esa ranura deja de estar marcada como mala (por ejemplo, al subir otra imagen)
+  const esp_partition_t *bad = esp_ota_get_last_invalid_partition();
+  esp_app_desc_t d;
+  prefs.begin("ota", false);
+  if (bad && esp_ota_get_partition_description(bad, &d) == ESP_OK) {
+    uint32_t id = (d.app_elf_sha256[0] << 24) | (d.app_elf_sha256[1] << 16) | (d.app_elf_sha256[2] << 8) | d.app_elf_sha256[3];
+    if (prefs.getUInt("rbsha", 0) != id) {
+      prefs.putUInt("rbsha", id);
+      Serial.printf(C_YELLOW C_BOLD "  [ota] ROLLBACK: la imagen de %s (SHA %02x%02x%02x%02x) falló antes de validarse." C_RESET "\n",
+                    bad->label, d.app_elf_sha256[0], d.app_elf_sha256[1], d.app_elf_sha256[2], d.app_elf_sha256[3]);
+      Serial.printf(C_YELLOW "  [ota] volví a la versión anterior (%s)." C_RESET "\n", esp_ota_get_running_partition()->label);
+    }
+  } else {
+    if (prefs.isKey("rbsha")) prefs.remove("rbsha");
+  }
+  prefs.end();
+
+  if (otaPending)
+    Serial.printf(C_CYAN "  [ota] imagen pendiente de verificar: se valida tras %lu s estables%s, o vuelvo a la anterior en %lu s." C_RESET "\n",
+                  (unsigned long)(OTA_STABLE_MS / 1000), otaNeedsWifi ? " con Wi-Fi conectado" : "",
+                  (unsigned long)(OTA_DEADLINE_MS / 1000));
+#ifdef OTA_SIMULATE_FAILURE
+  Serial.println(C_RED C_BOLD "  [ota] IMAGEN DEFECTUOSA DE PRUEBA (OTA_SIMULATE_FAILURE)." C_RESET);
+  if (otaPending) Serial.println(C_RED "  [ota] me voy a caer en ~5 s, antes de validarme, para probar el rollback." C_RESET);
+  else Serial.println(C_YELLOW "  [ota] no estoy pendiente de verificar (¿se grabó por USB?): no me caigo." C_RESET);
+#endif
+}
+
+// Se llama desde el bucle: valida la imagen cuando está sana o la revierte si no lo logra
+void otaHealthCheck() {
+#ifdef OTA_SIMULATE_FAILURE
+  if (otaPending && millis() > 5000) {
+    Serial.println(C_RED C_BOLD "  [ota] simulando una caída (abort)..." C_RESET);
+    Serial.flush();
+    abort();
+  }
+#endif
+  static uint32_t lastCheck = 0;
+  if (!otaPending || otaBusy || millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+  uint32_t t = millis();
+  bool wifiOk = !otaNeedsWifi || WiFi.status() == WL_CONNECTED;
+  if (t >= OTA_STABLE_MS && wifiOk) {
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    otaPending = false;
+    if (err == ESP_OK)
+      Serial.println(C_GREEN C_BOLD "  [ota] imagen validada: el rollback automático queda cancelado." C_RESET);
+    else
+      Serial.printf(C_RED "  [ota] no pude validar la imagen: %s" C_RESET "\n", esp_err_to_name(err));
+  } else if (t >= OTA_DEADLINE_MS) {
+    Serial.printf(C_RED "  [ota] la imagen no se pudo validar en %lu s: %s. Vuelvo a la versión anterior." C_RESET "\n",
+                  (unsigned long)(OTA_DEADLINE_MS / 1000), wifiOk ? "motivo desconocido" : "el Wi-Fi guardado no conectó");
+    Serial.flush();
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+    // Solo llega aquí si no hay una imagen anterior a la que volver
+    Serial.println(C_YELLOW "  [ota] no hay una imagen anterior válida: dejo esta como válida." C_RESET);
+    esp_ota_mark_app_valid_cancel_rollback();
+    otaPending = false;
+  } else if (t % 10000 < 1000) {
+    Serial.printf(C_DIM "  [ota] verificando la imagen... (%lu s%s)" C_RESET "\n", (unsigned long)(t / 1000),
+                  wifiOk ? "" : ", esperando Wi-Fi");
+  }
+}
+
+// Deep sleep y ULP terminan en un reinicio, que revertiría una imagen sin validar
+bool otaBlocksReset() {
+  if (!otaPending) return false;
+  Serial.printf(C_YELLOW "\n  La imagen aún está pendiente de verificar (faltan %lu s como máximo): un reinicio ahora la revertiría.\n"
+                "  Espera a que se valide (mira el estado con o) y vuelve a intentarlo." C_RESET "\n",
+                (unsigned long)(OTA_DEADLINE_MS > millis() ? (OTA_DEADLINE_MS - millis()) / 1000 : 0));
+  return true;
+}
+
+void startOta() {
+  if (otaStarted) return;
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.setMdnsEnabled(false);  // el sketch ya llamó a MDNS.begin(): evita iniciarlo dos veces
+  ArduinoOTA.onStart([]() {
+    otaBusy = true;
+    otaLedBefore = ledMode;
+    setLedMode(LED_OFF);
+    Serial.println(C_CYAN C_BOLD "\n  [ota] recibiendo una actualización desde el PC..." C_RESET);
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static int lastPct = -1;
+    int pct = total ? done * 100 / total : 0;
+    if (pct / 10 != lastPct / 10 || done == total) Serial.printf(C_DIM "  [ota] %d %%" C_RESET "\n", pct);
+    lastPct = pct;
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println(C_GREEN C_BOLD "  [ota] actualización recibida, reiniciando..." C_RESET);
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    const char *why = e == OTA_AUTH_ERROR ? "contraseña incorrecta" : e == OTA_BEGIN_ERROR ? "no pude iniciar la escritura"
+                    : e == OTA_CONNECT_ERROR ? "falló la conexión" : e == OTA_RECEIVE_ERROR ? "falló la recepción"
+                    : e == OTA_END_ERROR ? "falló el cierre (¿imagen dañada?)" : "error desconocido";
+    Serial.printf(C_RED "  [ota] actualización rechazada: %s" C_RESET "\n", why);
+    otaBusy = false;
+    setLedMode(otaLedBefore);
+  });
+  ArduinoOTA.begin();
+  if (mdnsStarted) MDNS.enableArduino(3232, true);
+  otaStarted = true;
+  Serial.printf(C_DIM "  [ota] listo para actualizar desde el PC (%s.local, puerto 3232, con contraseña)" C_RESET "\n", HOSTNAME);
+}
+
+// Página y subida del firmware por el navegador (con usuario y contraseña)
+bool webAuthOk() { return server.authenticate("admin", OTA_PASSWORD); }
+
+void handleUpdatePage() {
+  if (!webAuthOk()) {
+    server.requestAuthentication();
+    return;
+  }
+  String b = "<h1>Actualizar firmware</h1><p class='sub'>Versión actual: " FW_VERSION " (" FW_BUILD ")</p>"
+             "<input type='file' id='f' accept='.bin'>"
+             "<button class='btn' id='go' onclick='up()'>Subir y actualizar</button>"
+             "<progress id='pr' value='0' max='100' style='width:100%;margin-top:14px'></progress>"
+             "<p id='st' class='small'>Elige el archivo firmware.bin que genera PlatformIO.</p>"
+             "<p class='small'>Si la nueva versión no logra validarse, el ESP32 vuelve solo a la anterior.</p>"
+             "<a class='link' href='/panel'>← Volver al panel</a>"
+             "<script>function up(){const f=document.getElementById('f').files[0];"
+             "if(!f){st.textContent='Elige primero un archivo .bin';return}"
+             "const x=new XMLHttpRequest();x.open('POST','/update');"
+             "x.upload.onprogress=e=>{if(e.lengthComputable){pr.value=e.loaded*100/e.total;st.textContent=Math.round(pr.value)+' %'}};"
+             "x.onload=()=>{st.innerHTML=(x.status==200?\"<span class='ok'>✔ \":\"<span class='err'>✖ \")+x.responseText+'</span>';"
+             "go.disabled=x.status==200};"
+             "x.onerror=()=>{st.innerHTML=\"<span class='err'>✖ Se perdió la conexión con el ESP32.</span>\";go.disabled=false};"
+             "const d=new FormData();d.append('firmware',f,f.name);go.disabled=true;x.send(d)}</script>";
+  sendPage(b);
+}
+
+void handleUpdateUpload() {
+  HTTPUpload &u = server.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    webUpdateError = "";
+    webUpdateOk = false;
+    if (!webAuthOk()) {  // este manejador corre antes que handleUpdateDone: sin permiso no se escribe nada
+      webUpdateError = "no autorizado";
+      return;
+    }
+    Serial.printf(C_CYAN C_BOLD "\n  [ota] %s subió %s por la web..." C_RESET "\n", server.client().remoteIP().toString().c_str(), u.filename.c_str());
+    otaBusy = true;
+    otaLedBefore = ledMode;
+    setLedMode(LED_OFF);
+    if (Update.begin(UPDATE_SIZE_UNKNOWN)) webUpdating = true;
+    else webUpdateError = Update.errorString();
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (webUpdating && Update.write(u.buf, u.currentSize) != u.currentSize) webUpdateError = Update.errorString();
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (webUpdating && webUpdateError.isEmpty()) {
+      if (Update.end(true)) webUpdateOk = true;
+      else webUpdateError = Update.errorString();
+    }
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    webUpdateError = "subida interrumpida";
+  }
+  // Al terminar o fallar se cierra la escritura; si no fue un éxito, se devuelve el LED y la verificación
+  bool finished = u.status == UPLOAD_FILE_END || u.status == UPLOAD_FILE_ABORTED || !webUpdateError.isEmpty();
+  if (finished && webUpdating) {
+    if (!webUpdateOk) Update.abort();
+    webUpdating = false;
+  }
+  if (finished && !webUpdateOk && otaBusy) {
+    otaBusy = false;
+    setLedMode(otaLedBefore);
+  }
+}
+
+void handleUpdateDone() {
+  if (!webAuthOk()) {
+    server.requestAuthentication();
+    return;
+  }
+  if (!webUpdateOk) {
+    String why = webUpdateError.isEmpty() ? String("no llegó ningún archivo") : webUpdateError;
+    Serial.printf(C_RED "  [ota] actualización web rechazada: %s" C_RESET "\n", why.c_str());
+    server.send(500, "text/plain; charset=utf-8", "Falló la actualización: " + why);
+    return;
+  }
+  Serial.println(C_GREEN C_BOLD "  [ota] actualización web recibida, reiniciando..." C_RESET);
+  server.send(200, "text/plain; charset=utf-8", "Listo. El ESP32 se reinicia; en unos segundos vuelve a estar disponible.");
+  delay(500);
+  ESP.restart();
+}
+
+void otaMenu() {
+  header("Actualizaciones OTA");
+  const esp_partition_t *run = esp_ota_get_running_partition();
+  const esp_partition_t *other = esp_ota_get_next_update_partition(nullptr);
+  const esp_app_desc_t *me = esp_app_get_description();
+  Serial.printf("  Ejecutando   : %s en 0x%lX (%lu KB)\n", run->label, (unsigned long)run->address, (unsigned long)(run->size / 1024));
+  Serial.printf("  Versión      : " C_BOLD "%s" C_RESET ", compilada %s, SHA %02x%02x%02x%02x\n", FW_VERSION, FW_BUILD,
+                me->app_elf_sha256[0], me->app_elf_sha256[1], me->app_elf_sha256[2], me->app_elf_sha256[3]);
+  if (otaPending) {
+    Serial.printf("  Estado       : " C_YELLOW "pendiente de verificar" C_RESET " (límite en %lu s, necesita %lu s estables%s)\n",
+                  (unsigned long)(OTA_DEADLINE_MS > millis() ? (OTA_DEADLINE_MS - millis()) / 1000 : 0),
+                  (unsigned long)(OTA_STABLE_MS / 1000), otaNeedsWifi ? " y Wi-Fi conectado" : "");
+  } else {
+    Serial.printf("  Estado       : %s\n", otaStateStr(run));
+  }
+  if (other) {
+    esp_app_desc_t d;
+    Serial.printf("  Otra ranura  : %s en 0x%lX (%lu KB), %s\n", other->label, (unsigned long)other->address,
+                  (unsigned long)(other->size / 1024), otaStateStr(other));
+    if (esp_ota_get_partition_description(other, &d) == ESP_OK)
+      Serial.printf("  Su versión   : SHA %02x%02x%02x%02x\n", d.app_elf_sha256[0], d.app_elf_sha256[1], d.app_elf_sha256[2], d.app_elf_sha256[3]);
+    else
+      Serial.println("  Su versión   : vacía (no hay ninguna imagen)");
+  }
+  const esp_partition_t *bad = esp_ota_get_last_invalid_partition();
+  if (bad) Serial.printf("  Último rollback: la imagen de %s se revirtió por fallar antes de validarse\n", bad->label);
+  else Serial.println("  Último rollback: ninguno");
+  Serial.println("\n  Para actualizar:");
+  Serial.printf ("   - desde el PC: " C_BOLD "pio run -e esp32dev-ota -t upload" C_RESET " (o --upload-port <ip>)\n");
+  Serial.printf ("   - desde el navegador: " C_BOLD "http://%s/update" C_RESET " (usuario admin)\n",
+                 WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "<ip>");
+
+  if (!otaSlotUsable(other)) {
+    Serial.println(C_DIM "\n  No hay una versión anterior válida a la que volver." C_RESET);
+    return;
+  }
+  Serial.println(C_BOLD "\n  Pulsa " C_YELLOW "v" C_RESET C_BOLD " para volver a la versión anterior, o cualquier otra tecla para salir." C_RESET);
+  flushInput();
+  while (!Serial.available()) {  // mientras espera, el resto sigue funcionando
+    if (serverStarted) server.handleClient();
+    if (otaStarted) ArduinoOTA.handle();
+    otaHealthCheck();
+    delay(5);
+  }
+  if (tolower(Serial.read()) != 'v') {
+    flushInput();
+    return;
+  }
+  flushInput();
+  Serial.println(C_YELLOW "  Arrancando la versión anterior..." C_RESET);
+  Serial.flush();
+  if (otaPending) {
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  } else {
+    esp_err_t err = esp_ota_set_boot_partition(other);
+    if (err == ESP_OK) {
+      delay(200);
+      ESP.restart();
+    }
+    Serial.printf(C_RED "  No pude cambiar de ranura: %s" C_RESET "\n", esp_err_to_name(err));
+    return;
+  }
+  Serial.println(C_RED "  No pude volver atrás." C_RESET);
+}
+
 // ---------- deep sleep ----------
 
 void deepSleep() {
+  if (otaBlocksReset()) return;
   header("Deep sleep");
   Serial.println("  Me duermo 10 s consumiendo unos microamperios. Al despertar es como un reinicio,");
   Serial.println("  pero el contador de arranques (en RAM del RTC) se conserva.");
@@ -804,6 +1124,7 @@ int64_t wallClockUs() {
 }
 
 void ulpDemo() {
+  if (otaBlocksReset()) return;
   header("Coprocesador ULP");
   Serial.println("  El CPU principal se va a deep sleep. El ULP queda solo:");
   Serial.println("   - hace parpadear el LED azul");
@@ -949,6 +1270,8 @@ void setup() {
   server.on("/scan", handleScan);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", handleStatus);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound(handleNotFound);
 
   WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
@@ -971,6 +1294,7 @@ void setup() {
   else if (cause == ESP_SLEEP_WAKEUP_TIMER)
     Serial.printf(C_GREEN "Desperté del deep sleep. Arranque número %lu." C_RESET "\n", (unsigned long)bootCount);
   ulpPending = false;
+  otaBoot();
 
   WiFi.setHostname(HOSTNAME);
   String ssid, pass;
@@ -986,7 +1310,9 @@ void setup() {
 void loop() {
   if (portalActive) dns.processNextRequest();
   if (serverStarted) server.handleClient();
+  if (otaStarted) ArduinoOTA.handle();
   updateConnection();
+  otaHealthCheck();
   if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
   updateLed();
 
@@ -1020,6 +1346,7 @@ void loop() {
       break;
     case 's': deepSleep(); break;
     case 'u': ulpDemo(); break;
+    case 'o': otaMenu(); break;
     case 'h': case '?': printMenu(); break;
     case '\r': case '\n': case ' ': return;
     default: Serial.printf("\n  Tecla '%c' no reconocida. Pulsa h para ver el menú.\n", c); return;

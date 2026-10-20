@@ -18,6 +18,7 @@ Firmware para explorar lo que un ESP32 puede hacer por sí solo, sin conectarle 
 | `l` | LED integrado: apagado, parpadeo o respiración por PWM |
 | `s` | Deep sleep de 10 s con despertar por temporizador |
 | `u` | Coprocesador ULP: lecturas táctiles mientras el CPU principal duerme |
+| `o` | Actualizaciones OTA: ranuras, versiones, estado de la imagen y rollback manual |
 | `h` | Menú |
 
 ### Configuración Wi-Fi con portal cautivo
@@ -31,6 +32,37 @@ Funciona como muchos dispositivos IoT comerciales:
 5. Ya conectado, hay un panel web en `http://esp32-demo.local` o en la IP que se muestra en el monitor serie.
 
 Las credenciales nunca salen del ESP32 ni se imprimen en el monitor serie (solo se muestra el largo de la contraseña).
+
+### Actualizaciones OTA con rollback automático
+
+El ESP32 se puede actualizar por Wi-Fi, desde el PC (espota) o desde el navegador, sin cable. La tabla de particiones (`partitions.csv`) tiene dos ranuras de aplicación de 1.94 MB (`ota_0` y `ota_1`): la actualización se escribe en la ranura libre y la anterior queda como respaldo. La NVS conserva su offset, así que las credenciales Wi-Fi guardadas sobreviven.
+
+**Configuración inicial**
+
+1. Copia `secrets.ini.example` como `secrets.ini` y cambia `ota_password` (mínimo 8 caracteres, solo letras y números). El archivo está en `.gitignore` y la compilación falla si la contraseña falta o es muy corta.
+2. La primera vez hay que grabar por USB, porque cambia la tabla de particiones: `pio run -e esp32dev -t upload`.
+
+**Desde el PC**
+
+```bash
+pio run -e esp32dev-ota -t upload
+```
+
+Usa `esp32-demo.local` como destino. Si tu red no resuelve mDNS, indica la IP: `pio run -e esp32dev-ota -t upload --upload-port 192.168.1.50`. Con una contraseña incorrecta el ESP32 rechaza la actualización.
+
+En Windows, espota necesita que el firewall permita las conexiones entrantes a `python.exe` (el ESP32 se conecta de vuelta al PC para pedir el archivo). Si la actualización se queda en "Waiting for device", revisa esa regla.
+
+**Desde el navegador**
+
+Abre `http://esp32-demo.local/update` (o el enlace "Actualizar firmware" del panel), entra con usuario `admin` y la contraseña de `secrets.ini`, y sube el archivo `.pio/build/esp32dev/firmware.bin`. Sin credenciales responde 401.
+
+**Rollback automático**
+
+Una imagen recién actualizada arranca "pendiente de verificar". Se valida sola cuando lleva 30 s estable y, si hay una red Wi-Fi guardada, conectada. Si pasan 90 s sin validarse, o si el ESP32 se reinicia o se cae antes, vuelve a la versión anterior y lo avisa en el monitor serie. Mientras está pendiente, el deep sleep (`s`) y el ULP (`u`) se niegan a correr, porque terminan en un reinicio.
+
+Para probarlo, sube la imagen defectuosa: `pio run -e esp32dev-ota-faulty -t upload`. Se cae a los ~5 s de arrancar y el ESP32 regresa a la versión anterior. (Solo se cae si llegó por OTA; grabada por USB funciona normal.)
+
+La tecla `o` muestra la ranura en uso, la otra ranura, las versiones, el estado de la imagen y el último rollback, y con `v` permite volver a la versión anterior a mano.
 
 ### Coprocesador ULP
 
