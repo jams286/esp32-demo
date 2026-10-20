@@ -22,6 +22,7 @@
 #include <esp_timer.h>
 #include <sys/time.h>
 #include <driver/rtc_io.h>
+#include <esp32-hal-periman.h>
 #include <soc/rtc_cntl_reg.h>
 #include <soc/rtc_io_reg.h>
 #include <soc/sens_reg.h>
@@ -36,7 +37,7 @@
 
 #define LED_PIN 2
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 #define FW_BUILD __DATE__ " " __TIME__
 
 // La contraseña viene de secrets.ini (ver README); sin ella no se compila
@@ -528,7 +529,7 @@ void handlePanel() {
   b += "<tr><td>LED</td><td>" + String(ledModeNames[ledMode]) + "</td></tr>";
   b += "<tr><td>Arranques</td><td>" + String(bootCount) + "</td></tr>";
   b += "<tr><td>Firmware</td><td>" FW_VERSION "</td></tr>";
-  b += "</table><a class='btn' href='/led'>Cambiar LED</a><a class='btn' href='/update'>Actualizar firmware</a>";
+  b += "</table><a class='btn' href='/led'>Cambiar LED</a><a class='btn' href='/live'>Gráficas en vivo</a><a class='btn' href='/update'>Actualizar firmware</a>";
   sendPage(b);
 }
 
@@ -1024,6 +1025,8 @@ void handleUpdateDone() {
   ESP.restart();
 }
 
+void liveSample();  // sección "panel en vivo", más abajo
+
 void otaMenu() {
   header("Actualizaciones OTA");
   const esp_partition_t *run = esp_ota_get_running_partition();
@@ -1070,6 +1073,7 @@ void otaMenu() {
     otaHealthCheck();
     if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
     updateLed();
+    liveSample();
     delay(5);
   }
   if (tolower(Serial.read()) != 'v') {
@@ -1121,6 +1125,18 @@ enum { ULP_TICKS = 0, ULP_IDX = 1, ULP_SUB = 2, ULP_SAMPLES = 4 };  // offsets e
 const int ULP_PROG_START = ULP_SAMPLES + ULP_SAMPLES_N;
 
 RTC_DATA_ATTR int64_t ulpSleepStartUs = 0;
+
+// Copia de la última sesión del ULP, para el panel en vivo (/api/live)
+struct UlpResult {
+  bool valid;
+  uint8_t n;
+  bool byUlp;  // true = despertó el ULP; false = el temporizador de respaldo
+  uint32_t ticks;
+  float slept;
+  uint16_t vals[ULP_SAMPLES_N];
+};
+RTC_DATA_ATTR UlpResult ulpLast = {};
+bool liveHold = false;  // ulpDemo() detiene el muestreo del panel en vivo antes de dormir
 
 // El reloj del sistema sigue contando durante el deep sleep (lo lleva el RTC)
 int64_t wallClockUs() {
@@ -1190,6 +1206,14 @@ void ulpDemo() {
   rtc_gpio_set_direction(GPIO_NUM_2, RTC_GPIO_MODE_OUTPUT_ONLY);
   rtc_gpio_set_level(GPIO_NUM_2, 0);
 
+  // Con el RTC_PERIPH encendido, el sensor táctil sigue midiendo todos los pads que haya activado touchRead()
+  // y, al despertar, GPIO12 (MTDI) y GPIO15 (MTDO) son pines de arranque: si el sensor los mueve, el chip
+  // lee mal la flash. perimanClearPinBus() hace que el core borre el canal de ese pad del sensor, así que
+  // solo queda midiendo el de la demo.
+  liveHold = true;
+  for (int i = 0; i < touchCount; i++)
+    if (touchPins[i] != ULP_TOUCH_PIN) perimanClearPinBus(touchPins[i]);
+
   // touchRead() deja el sensor táctil midiendo de forma continua por hardware
   Serial.printf(C_DIM "  Valor táctil de GPIO%d sin tocar: %lu" C_RESET "\n", ULP_TOUCH_PIN,
                 (unsigned long)touchRead(ULP_TOUCH_PIN));
@@ -1200,6 +1224,7 @@ void ulpDemo() {
     Serial.printf(C_RED "  No pude cargar el programa del ULP: %s" C_RESET "\n", esp_err_to_name(err));
     rtc_gpio_deinit(GPIO_NUM_2);
     setLedMode(LED_OFF);
+    liveHold = false;
     return;
   }
   Serial.printf(C_DIM "  Programa del ULP: %d instrucciones en la palabra %d de la RAM RTC" C_RESET "\n", (int)size, ULP_PROG_START);
@@ -1230,6 +1255,12 @@ void showUlpResults(esp_sleep_wakeup_cause_t cause) {
   float slept = (wallClockUs() - ulpSleepStartUs) / 1e6f;
   Serial.printf("  El CPU durmió %.1f s. Mientras, el ULP corrió %lu veces (una cada %lu ms) y guardó %d lecturas.\n",
                 slept, (unsigned long)ticks, ticks ? (unsigned long)(slept * 1000 / ticks) : 0UL, n);
+  ulpLast.valid = true;
+  ulpLast.n = n;
+  ulpLast.byUlp = cause == ESP_SLEEP_WAKEUP_ULP;
+  ulpLast.ticks = ticks;
+  ulpLast.slept = slept;
+  for (int i = 0; i < n; i++) ulpLast.vals[i] = RTC_SLOW_MEM[ULP_SAMPLES + i] & 0xFFFF;
   if (n == 0) return;
 
   uint16_t vals[ULP_SAMPLES_N];
@@ -1259,6 +1290,255 @@ void showUlpResults(esp_sleep_wakeup_cause_t cause) {
   Serial.print("        └");
   for (int i = 0; i < n; i++) Serial.print("─");
   Serial.printf("\n         0 s%*d s\n", n - 4, (int)(slept + 0.5f));
+}
+
+// ---------- panel en vivo ----------
+//
+// Cada 250 ms se guarda una muestra en un buffer circular de 240 (60 s). El servidor web es
+// síncrono, así que la página /live no usa SSE ni WebSocket: consulta /api/live cada 500 ms
+// pidiendo solo las muestras nuevas (since=<seq>). Todo el JS y las gráficas van en el ESP32.
+
+const int LIVE_N = 240;
+const uint32_t LIVE_PERIOD_MS = 250;
+
+struct LiveSample {
+  uint32_t seq;  // crece sin parar; la primera muestra es la 1
+  uint32_t ms;
+  uint16_t touch[touchCount];
+  int8_t rssi;  // 0 = sin conexión
+  uint16_t heapKb;
+};
+LiveSample liveBuf[LIVE_N];
+uint32_t liveSeq = 0;           // seq de la última muestra
+float liveBase[touchCount];     // línea base de cada pin, como en touchLive()
+bool liveReady = false;
+uint32_t liveNextAt = 0;
+uint32_t liveCostUs = 0, liveCostMaxUs = 0;  // lo que tardan las 8 lecturas táctiles
+
+void liveSample() {
+  if (liveHold) return;
+  uint32_t now = millis();
+  if (liveReady && (int32_t)(now - liveNextAt) < 0) return;
+  if (!liveReady) {  // base inicial: promedio de 8 lecturas por pin
+    for (int i = 0; i < touchCount; i++) {
+      uint32_t sum = 0;
+      for (int k = 0; k < 8; k++) sum += touchRead(touchPins[i]);
+      liveBase[i] = max<uint32_t>(sum / 8, 1);
+    }
+    liveReady = true;
+    liveNextAt = now;
+  }
+  liveNextAt += LIVE_PERIOD_MS;
+  if ((int32_t)(now - liveNextAt) >= 0) liveNextAt = now + LIVE_PERIOD_MS;  // se atrasó: no recuperar a ráfagas
+
+  LiveSample &s = liveBuf[liveSeq % LIVE_N];
+  int64_t t0 = esp_timer_get_time();
+  for (int i = 0; i < touchCount; i++) {
+    uint32_t v = touchRead(touchPins[i]);
+    s.touch[i] = min<uint32_t>(v, 65535);
+    if (v >= liveBase[i] * 0.75f) liveBase[i] += ((float)v - liveBase[i]) / 64;  // EMA lenta solo sin tocar
+  }
+  liveCostUs = esp_timer_get_time() - t0;
+  if (liveCostUs > liveCostMaxUs) liveCostMaxUs = liveCostUs;
+  s.rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  s.heapKb = ESP.getFreeHeap() / 1024;
+  s.ms = now;
+  s.seq = ++liveSeq;
+}
+
+void jsonStr(String &j, const String &s) {
+  j += '"';
+  for (char c : s) {
+    if (c == '"' || c == '\\') j += '\\';
+    if ((uint8_t)c >= 0x20) j += c;
+  }
+  j += '"';
+}
+
+void handleApiLive() {
+  uint32_t since = server.hasArg("since") ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0;
+  if (since > liveSeq) since = 0;  // el ESP32 se reinició: el cliente tenía un seq de la vida anterior
+  uint32_t first = max<uint32_t>(since + 1, liveSeq > LIVE_N ? liveSeq - LIVE_N + 1 : 1);
+  uint32_t count = liveSeq >= first ? liveSeq - first + 1 : 0;
+
+  String j;
+  j.reserve(1200 + count * 80);
+  char b[256];
+  bool up = WiFi.status() == WL_CONNECTED;
+  snprintf(b, sizeof(b), "{\"now\":{\"up\":\"%s\",\"rst\":\"%s\",\"ms\":%lu,\"boot\":%lu,\"heap\":%lu,\"min\":%lu,\"rssi\":%d,\"tc\":%lu,\"tcmax\":%lu,\"seq\":%lu,\"ssid\":",
+           uptimeStr(), resetReasonStr(esp_reset_reason()), (unsigned long)millis(), (unsigned long)bootCount, (unsigned long)ESP.getFreeHeap(),
+           (unsigned long)ESP.getMinFreeHeap(), up ? WiFi.RSSI() : 0, (unsigned long)liveCostUs,
+           (unsigned long)liveCostMaxUs, (unsigned long)liveSeq);
+  j += b;
+  jsonStr(j, up ? WiFi.SSID() : String(""));
+  j += ",\"ip\":";
+  jsonStr(j, up ? WiFi.localIP().toString() : portalActive ? WiFi.softAPIP().toString() : String(""));
+  j += ",\"led\":";
+  jsonStr(j, ledModeNames[ledMode]);
+  snprintf(b, sizeof(b), ",\"fw\":\"" FW_VERSION "\",\"build\":\"" FW_BUILD "\",\"ota\":%s},\"pins\":[", otaPending ? "true" : "false");
+  j += b;
+  for (int i = 0; i < touchCount; i++) j += (i ? "," : "") + String(touchPins[i]);
+  j += "],\"base\":[";
+  for (int i = 0; i < touchCount; i++) j += (i ? "," : "") + String((int)(liveBase[i] + 0.5f));
+  j += "],\"samples\":[";
+  for (uint32_t q = first; q < first + count; q++) {  // [seq, ms, rssi, heap KB, 8 valores táctiles]
+    const LiveSample &s = liveBuf[(q - 1) % LIVE_N];
+    snprintf(b, sizeof(b), "%s[%lu,%lu,%d,%u", q > first ? "," : "", (unsigned long)s.seq, (unsigned long)s.ms, s.rssi, s.heapKb);
+    j += b;
+    for (int i = 0; i < touchCount; i++) j += "," + String(s.touch[i]);
+    j += ']';
+  }
+  j += "],\"ulp\":";
+  if (ulpLast.valid) {
+    snprintf(b, sizeof(b), "{\"n\":%u,\"cause\":\"%s\",\"ticks\":%lu,\"slept\":%.1f,\"pin\":%d,\"v\":[", ulpLast.n,
+             ulpLast.byUlp ? "ulp" : "timer", (unsigned long)ulpLast.ticks, ulpLast.slept, ULP_TOUCH_PIN);
+    j += b;
+    for (int i = 0; i < ulpLast.n; i++) j += (i ? "," : "") + String(ulpLast.vals[i]);
+    j += "]}";
+  } else {
+    j += "null";
+  }
+  j += '}';
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+void handleApiUlp() {
+  server.sendHeader("Cache-Control", "no-store");
+  if (otaBlocksReset()) {  // ya imprime el motivo en el monitor serie
+    server.send(409, "application/json", "{\"ok\":false,\"msg\":\"La imagen aún está pendiente de verificar (faltan " +
+                String(OTA_DEADLINE_MS > millis() ? (OTA_DEADLINE_MS - millis()) / 1000 : 0) +
+                " s como máximo): un reinicio ahora la revertiría.\"}");
+    return;
+  }
+  Serial.printf(C_MAGENTA "  [web] %s pidió la demo del ULP" C_RESET "\n", server.client().remoteIP().toString().c_str());
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"El ESP32 se va a dormir unos 15 s.\"}");
+  server.client().flush();  // la respuesta tiene que salir antes de que el chip se duerma
+  delay(100);
+  ulpDemo();
+}
+
+const char LIVE_BODY[] PROGMEM = R"html(<style>.card{max-width:960px}
+.g{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));margin:14px 0}
+.k{background:#334155;border-radius:10px;padding:10px 12px;font-size:.8em;color:#94a3b8}
+.k b{display:block;font-size:1.25em;margin-top:2px;color:#e2e8f0}
+canvas{width:100%;height:170px;background:#0f172a;border-radius:10px;display:block}
+h2{font-size:1em;margin:22px 0 8px}.lg span{margin-right:12px;font-size:.8em;white-space:nowrap}
+.lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+.pb{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px;margin-top:10px}
+.p{background:#334155;border-radius:8px;padding:6px 8px;font-size:.8em}.p.on{color:#4ade80;font-weight:600}
+.t{height:8px;background:#0f172a;border-radius:4px;margin-top:4px;overflow:hidden}
+.t div{height:100%;width:0;background:#64748b}.p.on .t div{background:#4ade80}
+.bg{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.8em;background:#14532d;color:#4ade80}
+.bg.w{background:#78350f;color:#fbbf24}
+.btn:disabled{opacity:.5}
+</style>
+<h1>Gráficas en vivo</h1><p class='sub' id='sc'>conectando...</p>
+<div class='g'>
+<div class='k'>Encendido<b id='up'>-</b></div>
+<div class='k'>Señal Wi-Fi<b><span id='sb'></span> <span id='rs'>-</span></b></div>
+<div class='k'>RAM libre<b id='hp'>-</b></div>
+<div class='k'>LED<b id='ld'>-</b></div>
+<div class='k'>Firmware<b id='fw'>-</b></div>
+<div class='k'>OTA<b><span id='ot' class='bg'>-</span></b></div>
+</div>
+<h2>Táctil: caída respecto a la base (últimos 60 s)</h2>
+<canvas id='c1'></canvas><div class='lg' id='lg'></div><div class='pb' id='pb'></div>
+<h2>Señal Wi-Fi (dBm)</h2><canvas id='c2'></canvas>
+<h2>RAM libre (KB)</h2><canvas id='c3'></canvas>
+<h2>Última sesión del ULP</h2><canvas id='c4'></canvas><p class='small' id='ui'>Todavía no hay una sesión.</p>
+<button class='btn' id='ub' onclick='runUlp()'>Ejecutar demo ULP (el ESP32 duerme ~15 s)</button>
+<p class='small' id='um'></p>
+<p class='small' id='dt'></p>
+<a class='link' href='/panel'>← Volver al panel</a> &nbsp; <a class='link' href='/update'>Actualizar firmware</a>
+<script>
+const P=[4,15,13,12,14,27,33,32],C=['#f87171','#fb923c','#facc15','#4ade80','#22d3ee','#60a5fa','#a78bfa','#f472b6'];
+const $=i=>document.getElementById(i);
+let S=[],since=0,fails=0,boot=-1,waiting=false,base=[],ulp=null;
+$('lg').innerHTML=P.map((p,i)=>`<span><i style="background:${C[i]}"></i>GPIO${p}</span>`).join('');
+$('pb').innerHTML=P.map((p,i)=>`<div class="p" id="p${i}">GPIO${p} <span id="pv${i}">0 %</span><div class="t"><div id="pf${i}"></div></div></div>`).join('');
+function chart(id,ser,o){
+ const c=$(id),r=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+ if(c.width!=Math.round(w*r)){c.width=Math.round(w*r);c.height=Math.round(h*r)}
+ const g=c.getContext('2d');g.setTransform(r,0,0,r,0,0);g.clearRect(0,0,w,h);
+ const L=40,B=16,T=6,W=w-L-4,H=h-B-T,lo=o.lo,hi=o.hi,Y=y=>T+H*(1-(Math.min(hi,Math.max(lo,y))-lo)/(hi-lo));
+ g.font='11px system-ui';g.fillStyle='#94a3b8';g.strokeStyle='#334155';g.lineWidth=1;
+ for(let k=0;k<=4;k++){const y=T+H*k/4;g.beginPath();g.moveTo(L,y);g.lineTo(L+W,y);g.stroke();g.fillText(Math.round(hi-(hi-lo)*k/4),2,y+4)}
+ const xl=o.xl||['-60 s','ahora'];g.fillText(xl[0],L,h-3);g.textAlign='right';g.fillText(xl[1],L+W,h-3);g.textAlign='left';
+ if(o.th!=null){g.strokeStyle='#64748b';g.setLineDash([4,4]);g.beginPath();g.moveTo(L,Y(o.th));g.lineTo(L+W,Y(o.th));g.stroke();g.setLineDash([])}
+ for(const s of ser){
+  if(o.bars){const n=s.p.length,bw=W/n;g.fillStyle=s.c;
+   s.p.forEach((y,i)=>{const t=Y(y);g.fillRect(L+i*bw+1,t,Math.max(1,bw-2),Math.max(1,T+H-t))});continue}
+  g.strokeStyle=s.c;g.lineWidth=1.5;g.beginPath();let pen=false;
+  for(const [x,y] of s.p){if(y==null){pen=false;continue}pen?g.lineTo(L+W*x,Y(y)):g.moveTo(L+W*x,Y(y));pen=true}
+  g.stroke()}
+}
+const drop=(v,i)=>base[i]?Math.max(0,Math.min(100,(base[i]-v)*100/base[i])):0;
+function range(a,pad,min){let lo=Math.floor(Math.min(...a)/pad)*pad-pad,hi=Math.ceil(Math.max(...a)/pad)*pad+pad;
+ if(hi-lo<min){const m=(hi+lo)/2;lo=m-min/2;hi=m+min/2}return[lo,hi]}
+function draw(){
+ if(!S.length)return;
+ const e=S[S.length-1].m,X=m=>1-(e-m)/60000,last=S[S.length-1];
+ chart('c1',P.map((p,i)=>({c:C[i],p:S.map(s=>[X(s.m),drop(s.t[i],i)])})),{lo:0,hi:100,th:25});
+ P.forEach((p,i)=>{const d=drop(last.t[i],i),on=d>25;$('p'+i).className='p'+(on?' on':'');
+  $('pv'+i).textContent=on?'TOCADO':Math.round(d)+' %';$('pf'+i).style.width=Math.min(100,d*100/70)+'%'});
+ const rs=S.map(s=>s.r).filter(v=>v),[rl,rh]=rs.length?range(rs,5,20):[-90,-30];
+ chart('c2',[{c:'#22d3ee',p:S.map(s=>[X(s.m),s.r||null])}],{lo:rl,hi:rh});
+ const [hl,hh]=range(S.map(s=>s.h),5,10);
+ chart('c3',[{c:'#4ade80',p:S.map(s=>[X(s.m),s.h])}],{lo:hl,hi:hh});
+}
+function drawUlp(){
+ if(!ulp){chart('c4',[],{lo:0,hi:100,xl:['','']});return}
+ const mn=Math.min(...ulp.v),mx=Math.max(...ulp.v),sp=mx-mn;
+ chart('c4',[{c:'#60a5fa',p:ulp.v}],{bars:1,lo:Math.max(0,Math.floor(mn-sp*.3-2)),hi:Math.ceil(mx+sp*.1+2),xl:['0 s',ulp.slept.toFixed(1)+' s']});
+ $('ui').textContent=`GPIO${ulp.pin}: ${ulp.n} lecturas, durmió ${ulp.slept.toFixed(1)} s, el ULP corrió ${ulp.ticks} veces (una cada ${ulp.ticks?Math.round(ulp.slept*1000/ulp.ticks):0} ms). Despertó: ${ulp.cause=='ulp'?'el ULP (buffer lleno)':'el temporizador de respaldo'}.`;
+}
+function cards(n){
+ $('up').textContent=n.up;$('hp').textContent=Math.round(n.heap/1024)+' KB';$('ld').textContent=n.led;$('fw').textContent=n.fw;
+ const k=!n.rssi?0:n.rssi>-55?4:n.rssi>-67?3:n.rssi>-78?2:1;
+ $('sb').innerHTML=['▂','▄','▆','█'].map((c,i)=>`<span style="opacity:${i<k?1:.25}">${c}</span>`).join('');
+ $('rs').textContent=n.rssi?n.rssi+' dBm':'sin Wi-Fi';
+ $('ot').textContent=n.ota?'pendiente de verificar':'validada';$('ot').className='bg'+(n.ota?' w':'');
+ $('dt').textContent=`${n.ssid||'portal'} · ${n.ip} · RAM mínima ${Math.round(n.min/1024)} KB · lecturas táctiles ${(n.tc/1000).toFixed(2)} ms (máx. ${(n.tcmax/1000).toFixed(2)} ms)`;
+}
+function merge(j){
+ const n=j.now;
+ if(boot>=0&&n.boot!==boot){  // el ESP32 se reinició (por ejemplo, tras dormir): empezar de cero
+  boot=n.boot;S=[];since=0;
+  if(waiting){waiting=false;$('ub').disabled=false;$('um').innerHTML="<span class='ok'>✔ Despertó. Esta es la nueva sesión.</span>"}
+  return 0}
+ boot=n.boot;base=j.base;
+ for(const a of j.samples)if(a[0]>since){S.push({s:a[0],m:a[1],r:a[2],h:a[3],t:a.slice(4)});since=a[0]}
+ const e=S.length?S[S.length-1].m:0;
+ while(S.length&&(e-S[0].m>60000||S.length>240))S.shift();
+ ulp=j.ulp;cards(n);draw();drawUlp();return 1}
+async function poll(){
+ let d=500;
+ const c=new AbortController(),to=setTimeout(()=>c.abort(),4000);
+ try{
+  const r=await fetch('/api/live?since='+since,{cache:'no-store',signal:c.signal});
+  if(!r.ok)throw 0;
+  const j=await r.json();fails=0;
+  d=merge(j)?500:0;$('sc').innerHTML="<span class='ok'>● en vivo</span>";
+ }catch(e){
+  fails++;d=Math.min(5000,500*2**fails);
+  $('sc').innerHTML="<span class='err'>● sin conexión</span> (reintento en "+(d/1000)+" s)";
+ }
+ clearTimeout(to);setTimeout(poll,d)}
+async function runUlp(){
+ $('ub').disabled=true;$('um').textContent='Enviando...';
+ try{
+  const r=await fetch('/api/ulp',{method:'POST'}),j=await r.json();
+  if(r.ok){waiting=true;$('um').textContent='⏳ El ESP32 duerme unos 15 s; la página se reconecta sola.'}
+  else{$('um').innerHTML="<span class='err'>"+j.msg+"</span>";$('ub').disabled=false}
+ }catch(e){$('um').innerHTML="<span class='err'>No se pudo enviar la petición.</span>";$('ub').disabled=false}}
+addEventListener('resize',()=>{draw();drawUlp()});
+poll();
+</script>)html";
+
+void handleLive() {
+  Serial.printf(C_MAGENTA "  [web] %s abrió las gráficas en vivo" C_RESET "\n", server.client().remoteIP().toString().c_str());
+  sendPage(String(FPSTR(LIVE_BODY)));
 }
 
 // ---------- cifrado por hardware ----------
@@ -1546,6 +1826,9 @@ void setup() {
   server.on("/scan", handleScan);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", handleStatus);
+  server.on("/live", handleLive);
+  server.on("/api/live", handleApiLive);
+  server.on("/api/ulp", HTTP_POST, handleApiUlp);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound(handleNotFound);
@@ -1591,6 +1874,7 @@ void loop() {
   otaHealthCheck();
   if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
   updateLed();
+  liveSample();
 
   if (!Serial.available()) {
     delay(2);

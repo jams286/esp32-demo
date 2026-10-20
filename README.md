@@ -34,6 +34,17 @@ Funciona como muchos dispositivos IoT comerciales:
 
 Las credenciales nunca salen del ESP32 ni se imprimen en el monitor serie (solo se muestra el largo de la contraseña).
 
+### Gráficas en vivo
+
+`http://esp32-demo.local/live` (o el botón "Gráficas en vivo" del panel; sin contraseña, como el panel) dibuja en el navegador, sin librerías ni internet, así que también abre desde el portal ESP32-Setup:
+
+- Tarjetas con encendido, señal Wi-Fi, RAM libre, modo del LED, versión del firmware y si la imagen está pendiente de verificar.
+- Caída del sensor táctil de los 8 pines en los últimos 60 s, con una barra por pin que se pone verde y dice "TOCADO" con la misma regla de `t` (caída de más del 25 % contra la base).
+- Señal Wi-Fi y RAM libre en los últimos 60 s.
+- La última sesión del ULP, con un botón para ejecutar la demo (el ESP32 duerme ~15 s y la página se reconecta sola; se niega mientras la imagen esté pendiente de verificar).
+
+El ESP32 toma una muestra cada 250 ms en un buffer circular de 240 (60 s). El servidor web es síncrono (un cliente a la vez), así que la página consulta cada 500 ms `GET /api/live?since=<seq>`, que devuelve solo las muestras nuevas en JSON. `POST /api/ulp` lanza la demo del ULP.
+
 ### Actualizaciones OTA con rollback automático
 
 El ESP32 se puede actualizar por Wi-Fi, desde el PC (espota) o desde el navegador, sin cable. La tabla de particiones (`partitions.csv`) tiene dos ranuras de aplicación de 1.94 MB (`ota_0` y `ota_1`): la actualización se escribe en la ranura libre y la anterior queda como respaldo. La NVS conserva su offset, así que las credenciales Wi-Fi guardadas sobreviven.
