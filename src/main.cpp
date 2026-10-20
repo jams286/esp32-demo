@@ -933,8 +933,8 @@ void startOta() {
                     : e == OTA_CONNECT_ERROR ? "falló la conexión" : e == OTA_RECEIVE_ERROR ? "falló la recepción"
                     : e == OTA_END_ERROR ? "falló el cierre (¿imagen dañada?)" : "error desconocido";
     Serial.printf(C_RED "  [ota] actualización rechazada: %s" C_RESET "\n", why);
+    if (otaBusy) setLedMode(otaLedBefore);
     otaBusy = false;
-    setLedMode(otaLedBefore);
   });
   ArduinoOTA.begin();
   if (mdnsStarted) MDNS.enableArduino(3232, true);
@@ -1061,9 +1061,13 @@ void otaMenu() {
   Serial.println(C_BOLD "\n  Pulsa " C_YELLOW "v" C_RESET C_BOLD " para volver a la versión anterior, o cualquier otra tecla para salir." C_RESET);
   flushInput();
   while (!Serial.available()) {  // mientras espera, el resto sigue funcionando
+    if (portalActive) dns.processNextRequest();
     if (serverStarted) server.handleClient();
     if (otaStarted) ArduinoOTA.handle();
+    updateConnection();
     otaHealthCheck();
+    if (portalCloseAt && (int32_t)(millis() - portalCloseAt) >= 0) stopPortal();
+    updateLed();
     delay(5);
   }
   if (tolower(Serial.read()) != 'v') {
