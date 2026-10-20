@@ -19,6 +19,7 @@ Firmware para explorar lo que un ESP32 puede hacer por sí solo, sin conectarle 
 | `s` | Deep sleep de 10 s con despertar por temporizador |
 | `u` | Coprocesador ULP: lecturas táctiles mientras el CPU principal duerme |
 | `o` | Actualizaciones OTA: ranuras, versiones, estado de la imagen y rollback manual |
+| `e` | Cifrado por hardware: AES-128/256 en modo CBC y SHA-256 contra una implementación por software con tablas (con autoverificación FIPS y MB/s de cada lado) |
 | `h` | Menú |
 
 ### Configuración Wi-Fi con portal cautivo

@@ -30,8 +30,11 @@
 #include <soc/soc.h>
 #include <ulp_common.h>
 #include <esp32/ulp.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/sha256.h>
 #include <algorithm>
 #include <vector>
+#include "soft_crypto.h"
 
 #define LED_PIN 2
 
@@ -170,6 +173,7 @@ void printMenu() {
   Serial.println("  " C_YELLOW "s" C_RESET "  deep sleep 10 s y despertar solo");
   Serial.println("  " C_YELLOW "u" C_RESET "  coprocesador ULP: LED y sensor táctil mientras el CPU duerme");
   Serial.println("  " C_YELLOW "o" C_RESET "  actualizaciones OTA: versión, particiones y rollback");
+  Serial.println("  " C_YELLOW "e" C_RESET "  cifrado por hardware: AES y SHA-256 contra software");
   Serial.println("  " C_YELLOW "h" C_RESET "  este menú");
 }
 
@@ -1259,6 +1263,276 @@ void showUlpResults(esp_sleep_wakeup_cause_t cause) {
   Serial.printf("\n         0 s%*d s\n", n - 4, (int)(slept + 0.5f));
 }
 
+// ---------- cifrado por hardware ----------
+
+void printHex(const uint8_t *d, int n, int maxBytes) {
+  for (int i = 0; i < min(n, maxBytes); i++) Serial.printf("%02x", d[i]);
+  if (n > maxBytes) Serial.print("...");
+}
+
+bool hexMatches(const uint8_t *d, const char *hex) {
+  for (size_t i = 0; hex[2 * i]; i++) {
+    char b[3] = {hex[2 * i], hex[2 * i + 1], 0};
+    if (d[i] != strtoul(b, nullptr, 16)) return false;
+  }
+  return true;
+}
+
+void checkLine(const char *name, bool ok, bool &all) {
+  Serial.printf("  %-44s %s\n", name, ok ? C_GREEN "OK" C_RESET : C_RED C_BOLD "FALLO" C_RESET);
+  if (!ok) all = false;
+}
+
+void hwSha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+  mbedtls_sha256_context c;
+  mbedtls_sha256_init(&c);
+  mbedtls_sha256_starts(&c, 0);
+  mbedtls_sha256_update(&c, data, len);
+  mbedtls_sha256_finish(&c, out);
+  mbedtls_sha256_free(&c);
+}
+
+void softSha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+  SoftSha256 c;
+  soft_sha256_init(&c);
+  soft_sha256_update(&c, data, len);
+  soft_sha256_final(&c, out);
+}
+
+// Vector conocido del apéndice C de FIPS-197: cifra y descifra un bloque, por hardware o por software
+bool aesKnownAnswer(bool hw, int keyBits, const char *ctHex) {
+  uint8_t key[32], pt[16], ct[16], back[16];
+  for (int i = 0; i < 32; i++) key[i] = i;
+  for (int i = 0; i < 16; i++) pt[i] = i * 0x11;  // 00112233...ff
+  if (hw) {
+    mbedtls_aes_context e, d;
+    mbedtls_aes_init(&e);
+    mbedtls_aes_init(&d);
+    mbedtls_aes_setkey_enc(&e, key, keyBits);
+    mbedtls_aes_setkey_dec(&d, key, keyBits);
+    mbedtls_aes_crypt_ecb(&e, MBEDTLS_AES_ENCRYPT, pt, ct);
+    mbedtls_aes_crypt_ecb(&d, MBEDTLS_AES_DECRYPT, ct, back);
+    mbedtls_aes_free(&e);
+    mbedtls_aes_free(&d);
+  } else {
+    SoftAes e, d;
+    soft_aes_setkey_enc(&e, key, keyBits);
+    soft_aes_setkey_dec(&d, key, keyBits);
+    soft_aes_encrypt_block(&e, pt, ct);
+    soft_aes_decrypt_block(&d, ct, back);
+  }
+  return hexMatches(ct, ctHex) && memcmp(back, pt, 16) == 0;
+}
+
+bool shaKnownAnswer(bool hw, const char *msg, const char *digestHex) {
+  uint8_t out[32];
+  if (hw) hwSha256((const uint8_t *)msg, strlen(msg), out);
+  else softSha256((const uint8_t *)msg, strlen(msg), out);
+  return hexMatches(out, digestHex);
+}
+
+// CBC por hardware (mbedTLS) o por software (soft_crypto), con la clave y el IV que se le pasen
+void aesCbc(bool hw, bool encrypt, int keyBits, const uint8_t *key, const uint8_t *ivIn, size_t len,
+            const uint8_t *in, uint8_t *out) {
+  uint8_t iv[16];
+  memcpy(iv, ivIn, 16);
+  if (hw) {
+    mbedtls_aes_context c;
+    mbedtls_aes_init(&c);
+    if (encrypt) mbedtls_aes_setkey_enc(&c, key, keyBits);
+    else mbedtls_aes_setkey_dec(&c, key, keyBits);
+    mbedtls_aes_crypt_cbc(&c, encrypt ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT, len, iv, in, out);
+    mbedtls_aes_free(&c);
+  } else {
+    SoftAes c;
+    if (encrypt) {
+      soft_aes_setkey_enc(&c, key, keyBits);
+      soft_aes_cbc_encrypt(&c, len, iv, in, out);
+    } else {
+      soft_aes_setkey_dec(&c, key, keyBits);
+      soft_aes_cbc_decrypt(&c, len, iv, in, out);
+    }
+  }
+}
+
+bool cryptoSelfCheck() {
+  bool all = true;
+  header("Cifrado: autoverificación");
+  const char *ct128 = "69c4e0d86a7b0430d8cdb78070b4c55a";
+  const char *ct256 = "8ea2b7ca516745bfeafc49904b496089";
+  checkLine("AES-128 FIPS-197 C.1 (hardware)", aesKnownAnswer(true, 128, ct128), all);
+  checkLine("AES-128 FIPS-197 C.1 (software)", aesKnownAnswer(false, 128, ct128), all);
+  checkLine("AES-256 FIPS-197 C.3 (hardware)", aesKnownAnswer(true, 256, ct256), all);
+  checkLine("AES-256 FIPS-197 C.3 (software)", aesKnownAnswer(false, 256, ct256), all);
+  const char *abc = "abc";
+  const char *abcSha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  const char *two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+  const char *twoSha = "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1";
+  checkLine("SHA-256 \"abc\" (hardware)", shaKnownAnswer(true, abc, abcSha), all);
+  checkLine("SHA-256 \"abc\" (software)", shaKnownAnswer(false, abc, abcSha), all);
+  checkLine("SHA-256 de 448 bits, 2 bloques (hardware)", shaKnownAnswer(true, two, twoSha), all);
+  checkLine("SHA-256 de 448 bits, 2 bloques (software)", shaKnownAnswer(false, two, twoSha), all);
+
+  // 4 KB aleatorios con clave e IV aleatorios: los dos lados deben dar lo mismo y poder deshacerse entre sí
+  const size_t N = 4096;
+  uint8_t *buf = (uint8_t *)malloc(N * 4);
+  if (!buf) {
+    Serial.println(C_RED "  No hay memoria para la prueba de 4 KB." C_RESET);
+    return false;
+  }
+  uint8_t *pt = buf, *ctHw = buf + N, *ctSw = buf + 2 * N, *back = buf + 3 * N;
+  uint8_t key[32], iv[16];
+  esp_fill_random(pt, N);
+  esp_fill_random(key, sizeof(key));
+  esp_fill_random(iv, sizeof(iv));
+  aesCbc(true, true, 256, key, iv, N, pt, ctHw);
+  aesCbc(false, true, 256, key, iv, N, pt, ctSw);
+  checkLine("CBC 4 KB: texto cifrado igual en HW y SW", memcmp(ctHw, ctSw, N) == 0, all);
+  aesCbc(false, false, 256, key, iv, N, ctHw, back);
+  checkLine("CBC 4 KB: cifrado HW, descifrado SW", memcmp(back, pt, N) == 0, all);
+  aesCbc(true, false, 256, key, iv, N, ctSw, back);
+  checkLine("CBC 4 KB: cifrado SW, descifrado HW", memcmp(back, pt, N) == 0, all);
+  free(buf);
+  Serial.printf("  %s\n", all ? C_GREEN C_BOLD "Todo correcto." C_RESET : C_RED C_BOLD "Hay verificaciones que fallaron." C_RESET);
+  return all;
+}
+
+void cryptoSmallDemo() {
+  header("Cifrado: demo con un texto");
+  const char *text = "Hola desde el ESP32";
+  size_t tl = strlen(text);
+  size_t padded = (tl / 16 + 1) * 16;  // relleno PKCS#7
+  uint8_t pt[32] = {0}, ct[32], back[32], key[32], iv[16], digest[32];
+  memcpy(pt, text, tl);
+  for (size_t i = tl; i < padded; i++) pt[i] = padded - tl;
+  esp_fill_random(key, sizeof(key));
+  esp_fill_random(iv, sizeof(iv));
+
+  Serial.printf("  Texto     : \"%s\" (%u bytes, %u con relleno)\n", text, (unsigned)tl, (unsigned)padded);
+  Serial.print("  Clave     : AES-256 de esp_random(): ");
+  printHex(key, 32, 8);
+  Serial.print("\n  IV        : ");
+  printHex(iv, 16, 16);
+  aesCbc(true, true, 256, key, iv, padded, pt, ct);
+  Serial.print("\n  Cifrado   : ");
+  printHex(ct, padded, 16);
+  Serial.println(C_DIM "  (por hardware)" C_RESET);
+  aesCbc(false, false, 256, key, iv, padded, ct, back);
+  size_t plen = padded - back[padded - 1];
+  Serial.printf("  Descifrado: \"%.*s\"" C_DIM "  (por software)" C_RESET "\n", (int)plen, (const char *)back);
+  hwSha256((const uint8_t *)text, tl, digest);
+  Serial.print("  SHA-256   : ");
+  printHex(digest, 32, 32);
+  Serial.println();
+}
+
+enum CryptoTest { CT_AES128_ENC, CT_AES256_ENC, CT_AES256_DEC, CT_SHA256, CT_COUNT };
+const char *cryptoTestNames[] = {"AES-128-CBC cifrar", "AES-256-CBC cifrar", "AES-256-CBC descifrar", "SHA-256"};
+
+// Mide MB/s con ~1 s de trabajo real: el tiempo que se cede a otras tareas no cuenta
+double cryptoThroughput(CryptoTest test, bool hw, uint8_t *in, uint8_t *out, size_t len) {
+  int keyBits = test == CT_AES128_ENC ? 128 : 256;
+  bool encrypt = test != CT_AES256_DEC;
+  uint8_t key[32], iv[16];
+  esp_fill_random(key, sizeof(key));
+  esp_fill_random(iv, sizeof(iv));
+  mbedtls_aes_context hc;
+  SoftAes sc;
+  mbedtls_sha256_context hs;
+  SoftSha256 ss;
+  mbedtls_aes_init(&hc);
+  if (test == CT_SHA256) {
+    if (hw) {
+      mbedtls_sha256_init(&hs);
+      mbedtls_sha256_starts(&hs, 0);
+    } else {
+      soft_sha256_init(&ss);
+    }
+  } else if (hw) {
+    if (encrypt) mbedtls_aes_setkey_enc(&hc, key, keyBits);
+    else mbedtls_aes_setkey_dec(&hc, key, keyBits);
+  } else {
+    if (encrypt) soft_aes_setkey_enc(&sc, key, keyBits);
+    else soft_aes_setkey_dec(&sc, key, keyBits);
+  }
+
+  int64_t busy = 0, sinceYield = 0;
+  uint64_t bytes = 0;
+  while (busy < 1000000) {
+    int64_t t0 = esp_timer_get_time();
+    if (test == CT_SHA256) {
+      if (hw) mbedtls_sha256_update(&hs, in, len);
+      else soft_sha256_update(&ss, in, len);
+    } else if (hw) {
+      mbedtls_aes_crypt_cbc(&hc, encrypt ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT, len, iv, in, out);
+    } else if (encrypt) {
+      soft_aes_cbc_encrypt(&sc, len, iv, in, out);
+    } else {
+      soft_aes_cbc_decrypt(&sc, len, iv, in, out);
+    }
+    int64_t dt = esp_timer_get_time() - t0;
+    busy += dt;
+    sinceYield += dt;
+    bytes += len;
+    if (sinceYield > 50000) {  // ceder la CPU para que no salte el watchdog
+      vTaskDelay(1);
+      sinceYield = 0;
+    }
+  }
+  if (test == CT_SHA256 && hw) mbedtls_sha256_free(&hs);
+  mbedtls_aes_free(&hc);
+  return (double)bytes / busy;  // bytes por microsegundo = MB/s
+}
+
+void cryptoDemo() {
+  if (!cryptoSelfCheck()) {
+    Serial.println(C_RED "  Me detengo: sin resultados correctos el benchmark no tiene sentido." C_RESET);
+    return;
+  }
+  cryptoSmallDemo();
+
+  header("Cifrado: hardware contra software");
+  Serial.println("  Hardware: mbedTLS con acelerador. Software: AES con tablas, como mbedTLS sin acelerador.");
+  Serial.println(C_DIM "  Modo CBC, búfer de 8 KB, ~1 s por medición (8 mediciones)..." C_RESET);
+  const size_t LEN = 8192;
+  uint8_t *in = (uint8_t *)malloc(LEN), *out = (uint8_t *)malloc(LEN);
+  if (!in || !out) {
+    Serial.println(C_RED "  No hay memoria para el benchmark." C_RESET);
+    free(in);
+    free(out);
+    return;
+  }
+  esp_fill_random(in, LEN);
+
+  double hwv[CT_COUNT], swv[CT_COUNT];
+  for (int t = 0; t < CT_COUNT; t++) {
+    hwv[t] = cryptoThroughput((CryptoTest)t, true, in, out, LEN);
+    swv[t] = cryptoThroughput((CryptoTest)t, false, in, out, LEN);
+  }
+  free(in);
+  free(out);
+
+  int best = 0, worst = 0;
+  for (int t = 0; t < CT_COUNT; t++) {
+    double speedup = hwv[t] / swv[t];
+    if (speedup > hwv[best] / swv[best]) best = t;
+    if (speedup < hwv[worst] / swv[worst]) worst = t;
+    double top = max(hwv[t], swv[t]);
+    Serial.printf("\n  %s\n", cryptoTestNames[t]);
+    Serial.print("    hardware ");
+    bar((int)(hwv[t] * 100), (int)(top * 100), 30, C_GREEN);
+    Serial.printf(" %6.2f MB/s\n    software ", hwv[t]);
+    bar((int)(swv[t] * 100), (int)(top * 100), 30, C_YELLOW);
+    Serial.printf(" %6.2f MB/s\n    Aceleración: " C_BOLD "%.2fx" C_RESET "\n", swv[t], speedup);
+  }
+  double bestX = hwv[best] / swv[best], worstX = hwv[worst] / swv[worst];
+  if (bestX < 1.0)
+    Serial.println("\n  Resumen: en este chip el software con tablas le gana al hardware en todas las pruebas.");
+  else
+    Serial.printf("\n  Resumen: el hardware gana más en %s (%.2fx) y menos en %s (%.2fx).\n", cryptoTestNames[best], bestX,
+                  cryptoTestNames[worst], worstX);
+}
+
 // ---------- arranque y bucle ----------
 
 void setup() {
@@ -1351,6 +1625,7 @@ void loop() {
     case 's': deepSleep(); break;
     case 'u': ulpDemo(); break;
     case 'o': otaMenu(); break;
+    case 'e': cryptoDemo(); break;
     case 'h': case '?': printMenu(); break;
     case '\r': case '\n': case ' ': return;
     default: Serial.printf("\n  Tecla '%c' no reconocida. Pulsa h para ver el menú.\n", c); return;
